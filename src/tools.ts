@@ -59,6 +59,10 @@ async function listChangedFiles(repo: RepoRuntime, staged: boolean): Promise<str
   return out.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
+export function buildRepoTreeGitArgs(prefix: string): string[] {
+  return ['ls-files', '--cached', '--others', '--exclude-standard', '--', prefix === '.' ? '.' : prefix];
+}
+
 function walkFiles(config: AppConfig, repo: RepoRuntime, startRel: string, maxFiles: number): string[] {
   const files: string[] = [];
   const startAbs = path.join(repo.absPath, startRel === '.' ? '' : startRel);
@@ -127,7 +131,7 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
     async ({ repo: repoName, pathPrefix = '.', maxEntries = 200 }) => {
       const repo = getRepo(config, repos, repoName);
       const prefix = ensurePathAllowed(config, repo, pathPrefix, 'read');
-      const raw = await gitOutput(repo, ['ls-files', '--cached', '--others', '--exclude-standard', '--', prefix === '.' ? '' : prefix], 'List repo files');
+      const raw = await gitOutput(repo, buildRepoTreeGitArgs(prefix), 'List repo files');
       const allFiles = raw
         .split(/\r?\n/)
         .map((line) => line.trim())

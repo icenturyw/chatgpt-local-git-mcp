@@ -27,6 +27,7 @@ const DEFAULT_CONFIG: Omit<AppConfig, 'repos'> = {
       'node_modules',
       '__pycache__',
     ],
+    protectedBranches: ['main', 'master'],
   },
   auth: {
     bearerTokenEnv: 'MCP_AUTH_TOKEN',
@@ -116,6 +117,10 @@ export function loadConfig(): AppConfig {
       globalDeniedPaths: [
         ...DEFAULT_CONFIG.security.globalDeniedPaths,
         ...((parsed.security?.globalDeniedPaths ?? []) as string[]),
+      ],
+      protectedBranches: [
+        ...DEFAULT_CONFIG.security.protectedBranches,
+        ...((parsed.security?.protectedBranches ?? []) as string[]),
       ],
     },
     auth: {

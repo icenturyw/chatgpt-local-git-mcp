@@ -26,6 +26,7 @@ export type AppConfig = {
     maxWriteBytes: number;
     commandTimeoutMs: number;
     globalDeniedPaths: string[];
+    protectedBranches: string[];
   };
   auth?: {
     bearerTokenEnv?: string;

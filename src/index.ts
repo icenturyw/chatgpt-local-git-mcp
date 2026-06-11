@@ -5,6 +5,7 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { loadConfig, getRepos } from './config.js';
 import { createMcpServer } from './tools.js';
 import { UserFacingError } from './security.js';
+import { watchReposDir } from './watcher.js';
 
 const config = loadConfig();
 const repos = getRepos(config);
@@ -114,6 +115,9 @@ app.listen(config.server.port, config.server.host, () => {
   console.log(`chatgpt-local-git-mcp listening on http://${config.server.host}:${config.server.port}${config.server.mcpPath}`);
   if (config.reposDir) {
     console.log(`Auto-discovering repos from: ${config.reposDir}`);
+    watchReposDir(config, repos, (updatedRepos) => {
+      console.log(`Repos updated (${updatedRepos.length}): ${updatedRepos.map((r) => r.name).join(', ')}`);
+    });
   }
   console.log(`Configured repos (${repos.length}): ${repos.map((repo) => repo.name).join(', ')}`);
   if (!getBearerToken()) {
