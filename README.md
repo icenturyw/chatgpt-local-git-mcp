@@ -22,12 +22,15 @@
 | 工具 | 作用 |
 |---|---|
 | `list_repos` | 查看配置里的仓库 |
+| `list_tasks` | 查看仓库的白名单任务 |
 | `repo_tree` | 查看仓库文件列表，自动过滤敏感路径 |
 | `read_file` | 读取文本文件，返回 `sha256` 用于安全覆盖 |
 | `search_code` | 搜索代码文本 |
 | `git_status` | 查看当前分支、HEAD、短状态 |
 | `git_diff` | 查看改动 diff，提交前审查用 |
+| `git_diff_summary` | 查看结构化 diff 摘要（增删行数） |
 | `prepare_push` | 只生成 push 命令，不执行 |
+| `prepare_pr_text` | 生成 PR 标题和内容文案 |
 
 ### 写入/执行工具
 
@@ -35,10 +38,14 @@
 |---|---|---:|
 | `create_branch` | 创建并切换本地分支 | 否 |
 | `write_file` | 写入允许路径下的文本文件 | 否 |
+| `replace_text` | 安全替换文件中的文本 | 否 |
 | `apply_patch` | 应用 unified diff patch | 否 |
+| `validate_patch` | 诊断 patch 是否可应用 | 否 |
 | `run_task` | 执行白名单任务，比如测试/构建 | 否 |
 | `git_add` | stage 指定允许文件 | 否 |
 | `git_commit` | 创建本地 commit | 否 |
+| `list_backups` | 列出备份 | 否 |
+| `restore_backup` | 恢复备份文件 | 否 |
 
 ---
 
@@ -131,6 +138,17 @@ https://xxxx.ngrok.app/mcp
 
 ```text
 使用 Local Git MCP 操作 ai-btms 仓库。先 list_repos 和 git_status，创建本地分支 feat/chatgpt-fix-admin-api，然后读取相关文件，修改代码，运行 pytest，展示 git_diff 给我确认。确认后执行 git_add 和 git_commit。最后只用 prepare_push 输出 push 命令，不要执行 push。
+```
+
+推荐流程：
+
+```text
+list_repos
+git_status
+list_tasks
+run_task typecheck
+run_task test
+run_task build
 ```
 
 ---

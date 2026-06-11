@@ -26,6 +26,7 @@ import {
   validateCommitMessage,
   writeTempPatch,
 } from './git.js';
+import { writeAuditLog, type AuditEvent } from './audit.js';
 
 function result<T extends Record<string, unknown>>(structuredContent: T): ToolTextResult<T> {
   return {
@@ -90,6 +91,36 @@ function walkFiles(config: AppConfig, repo: RepoRuntime, startRel: string, maxFi
     }
   }
   return files;
+}
+
+export function isProtectedBranch(branch: string, protectedBranches: string[]): boolean {
+  return protectedBranches.includes(branch);
+}
+
+async function ensureWritableBranch(
+  config: AppConfig,
+  repo: RepoRuntime,
+  action: string,
+): Promise<void> {
+  const branch = await currentBranch(repo);
+  if (isProtectedBranch(branch, config.security.protectedBranches)) {
+    throw new UserFacingError(
+      `${action} is blocked on protected branch '${branch}'. Create and switch to a feature branch first.`,
+    );
+  }
+}
+
+function audit(repo: RepoRuntime, tool: string, success: boolean, paths?: string[], error?: string, branch?: string): void {
+  const event: AuditEvent = {
+    time: new Date().toISOString(),
+    tool,
+    repo: repo.name,
+    branch,
+    paths,
+    success,
+    error,
+  };
+  writeAuditLog(repo.absPath, event);
 }
 
 export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpServer {
@@ -346,6 +377,7 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
     },
     async ({ repo: repoName, path: relInput, content, expected_sha256 }) => {
       const repo = getRepo(config, repos, repoName);
+      await ensureWritableBranch(config, repo, 'write_file');
       const rel = ensurePathAllowed(config, repo, relInput, 'write');
       const bytes = Buffer.byteLength(content, 'utf8');
       if (bytes > config.security.maxWriteBytes) throw new UserFacingError(`Content too large (${bytes} bytes).`);
@@ -363,6 +395,8 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       const backupPath = makeBackup(repo, [rel]);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, content, 'utf8');
+      const branch = await currentBranch(repo);
+      audit(repo, 'write_file', true, [rel], undefined, branch);
       return result({ repo: repo.name, path: rel, sha256: sha256Text(content), bytes, backupPath });
     },
   );
@@ -378,6 +412,7 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
     },
     async ({ repo: repoName, patch }) => {
       const repo = getRepo(config, repos, repoName);
+      await ensureWritableBranch(config, repo, 'apply_patch');
       if (Buffer.byteLength(patch, 'utf8') > config.security.maxWriteBytes * 4) throw new UserFacingError('Patch is too large.');
       const touchedPaths = parsePatchTouchedPaths(patch);
       if (touchedPaths.length === 0) throw new UserFacingError('Patch does not contain recognizable file paths.');
@@ -388,6 +423,8 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       assertSuccess(check, 'Validate patch');
       const applied = await git(repo, ['apply', '--whitespace=nowarn', patchPath]);
       assertSuccess(applied, 'Apply patch');
+      const branch = await currentBranch(repo);
+      audit(repo, 'apply_patch', true, touchedPaths, undefined, branch);
       return result({ repo: repo.name, touchedPaths, backupPath, status: 'applied' });
     },
   );
@@ -415,6 +452,8 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       const run = await runCommand(repo.absPath, taskConfig.command[0], taskConfig.command.slice(1), taskConfig.timeoutMs ?? config.security.commandTimeoutMs);
       const stdout = clipText(run.stdout, config.security.maxReadBytes);
       const stderr = clipText(run.stderr, config.security.maxReadBytes);
+      const branch = await currentBranch(repo);
+      audit(repo, 'run_task', run.code === 0 && !run.timedOut, undefined, run.code !== 0 ? `Exit code: ${run.code}` : undefined, branch);
       return result({ repo: repo.name, task, command: taskConfig.command, code: run.code, stdout: stdout.text, stderr: stderr.text, timedOut: run.timedOut, success: run.code === 0 && !run.timedOut });
     },
   );
@@ -430,10 +469,13 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
     },
     async ({ repo: repoName, paths }) => {
       const repo = getRepo(config, repos, repoName);
+      await ensureWritableBranch(config, repo, 'git_add');
       const rels = paths.map((p) => ensurePathAllowed(config, repo, p, 'write'));
       const add = await git(repo, ['add', '--', ...rels]);
       assertSuccess(add, 'Stage files');
       const status = await gitOutput(repo, ['status', '--short'], 'Get git status');
+      const branch = await currentBranch(repo);
+      audit(repo, 'git_add', true, rels, undefined, branch);
       return result({ repo: repo.name, stagedPaths: rels, status });
     },
   );
@@ -449,6 +491,7 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
     },
     async ({ repo: repoName, message }) => {
       const repo = getRepo(config, repos, repoName);
+      await ensureWritableBranch(config, repo, 'git_commit');
       const msg = validateCommitMessage(message);
       const staged = await gitOutput(repo, ['diff', '--cached', '--name-only'], 'List staged files');
       const stagedFiles = staged.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -467,7 +510,9 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       const commit = await git(repo, ['commit', '-m', msg], config.security.commandTimeoutMs);
       assertSuccess(commit, 'Create local commit');
       const hash = await currentHead(repo);
-      return result({ repo: repo.name, commit: hash, branch: await currentBranch(repo), message: msg, note: 'Local commit created. No remote push was performed.' });
+      const branch = await currentBranch(repo);
+      audit(repo, 'git_commit', true, stagedFiles, undefined, branch);
+      return result({ repo: repo.name, commit: hash, branch, message: msg, note: 'Local commit created. No remote push was performed.' });
     },
   );
 
@@ -494,12 +539,404 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       if (setUpstream) args.push('-u');
       args.push(remote, targetBranch);
       const command = ['git', ...args.map(shellQuote)].join(' ');
+      const currentBranchName = await currentBranch(repo);
+      audit(repo, 'prepare_push', true, undefined, undefined, currentBranchName);
       return result({
         repo: repo.name,
         branch: targetBranch,
         remote,
         command,
         warning: 'Review git status and git diff before running this command manually. This MCP server did not push anything.',
+      });
+    },
+  );
+
+  server.registerTool(
+    'replace_text',
+    {
+      title: 'Replace text in a file',
+      description: 'Use this to safely replace text in a file. Only allows unique matches by default. Use replaceAll for multiple occurrences.',
+      inputSchema: {
+        repo: z.string(),
+        path: z.string(),
+        oldText: z.string().min(1),
+        newText: z.string(),
+        expected_sha256: z.string().optional(),
+        replaceAll: z.boolean().default(false),
+      },
+      outputSchema: {
+        repo: z.string(),
+        path: z.string(),
+        sha256: z.string(),
+        bytes: z.number(),
+        backupPath: z.string().nullable(),
+        replacements: z.number(),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+    async ({ repo: repoName, path: relInput, oldText, newText, expected_sha256, replaceAll = false }) => {
+      const repo = getRepo(config, repos, repoName);
+      await ensureWritableBranch(config, repo, 'replace_text');
+      const rel = ensurePathAllowed(config, repo, relInput, 'write');
+      const abs = path.join(repo.absPath, rel);
+
+      if (!fs.existsSync(abs)) {
+        throw new UserFacingError(`File '${rel}' does not exist. Use write_file to create it.`);
+      }
+
+      const buffer = ensureTextFileReadable(abs, config.security.maxReadBytes);
+      const content = buffer.toString('utf8');
+
+      if (config.security.requireExpectedShaForOverwrite && !expected_sha256) {
+        const currentSha = sha256Buffer(buffer);
+        throw new UserFacingError(`expected_sha256 is required to overwrite '${rel}'. Call read_file first. Current sha256: ${currentSha}`);
+      }
+
+      if (expected_sha256) {
+        const currentSha = sha256Buffer(buffer);
+        if (expected_sha256 !== currentSha) {
+          throw new UserFacingError(`sha256 mismatch for '${rel}'. Current=${currentSha}, expected=${expected_sha256}. Re-read the file before writing.`);
+        }
+      }
+
+      const count = content.split(oldText).length - 1;
+      if (count === 0) {
+        throw new UserFacingError(`oldText not found in '${rel}'.`);
+      }
+      if (count > 1 && !replaceAll) {
+        throw new UserFacingError(`oldText appears ${count} times in '${rel}'. Use replaceAll=true to replace all occurrences, or provide more specific text.`);
+      }
+
+      const newContent = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
+      const backupPath = makeBackup(repo, [rel]);
+      fs.writeFileSync(abs, newContent, 'utf8');
+      const branch = await currentBranch(repo);
+      audit(repo, 'replace_text', true, [rel], undefined, branch);
+
+      return result({
+        repo: repo.name,
+        path: rel,
+        sha256: sha256Text(newContent),
+        bytes: Buffer.byteLength(newContent, 'utf8'),
+        backupPath,
+        replacements: count,
+      });
+    },
+  );
+
+  server.registerTool(
+    'validate_patch',
+    {
+      title: 'Validate a unified diff patch',
+      description: 'Use this to check if a patch can be applied before calling apply_patch. Shows touched paths and validation errors.',
+      inputSchema: { repo: z.string(), patch: z.string().min(1) },
+      outputSchema: {
+        repo: z.string(),
+        touchedPaths: z.array(z.string()),
+        allowed: z.boolean(),
+        valid: z.boolean(),
+        stdout: z.string(),
+        stderr: z.string(),
+        suggestion: z.string(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName, patch }) => {
+      const repo = getRepo(config, repos, repoName);
+      const touchedPaths = parsePatchTouchedPaths(patch);
+
+      if (touchedPaths.length === 0) {
+        return result({
+          repo: repo.name,
+          touchedPaths: [],
+          allowed: false,
+          valid: false,
+          stdout: '',
+          stderr: 'Patch does not contain recognizable file paths.',
+          suggestion: 'Ensure the patch contains diff --git or +++ b/ lines.',
+        });
+      }
+
+      let allowed = true;
+      const deniedPaths: string[] = [];
+      for (const rel of touchedPaths) {
+        try {
+          ensurePathAllowed(config, repo, rel, 'write');
+        } catch {
+          allowed = false;
+          deniedPaths.push(rel);
+        }
+      }
+
+      let valid = false;
+      let stdout = '';
+      let stderr = '';
+      let suggestion = '';
+
+      try {
+        const patchPath = await writeTempPatch(patch);
+        const check = await git(repo, ['apply', '--check', patchPath]);
+        if (check.code === 0) {
+          valid = true;
+          stdout = 'Patch is valid and can be applied.';
+          suggestion = 'You can now call apply_patch to apply this patch.';
+        } else {
+          stderr = check.stderr || 'Patch validation failed.';
+          suggestion = 'Check the patch format and ensure it matches the current file contents.';
+        }
+      } catch (err) {
+        stderr = err instanceof Error ? err.message : String(err);
+        suggestion = 'The patch may be corrupted or based on outdated file contents.';
+      }
+
+      if (!allowed) {
+        suggestion = `Some paths are not allowed for write: ${deniedPaths.join(', ')}. Update config.yaml allowedWritePaths if needed.`;
+      }
+
+      return result({
+        repo: repo.name,
+        touchedPaths,
+        allowed,
+        valid,
+        stdout,
+        stderr,
+        suggestion,
+      });
+    },
+  );
+
+  server.registerTool(
+    'prepare_pr_text',
+    {
+      title: 'Generate PR title and body',
+      description: 'Use this to generate a PR title and body based on current changes. Does not create a PR or access remote.',
+      inputSchema: {
+        repo: z.string(),
+        title: z.string().optional(),
+      },
+      outputSchema: {
+        title: z.string(),
+        body: z.string(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName, title: customTitle }) => {
+      const repo = getRepo(config, repos, repoName);
+
+      const diffSummary = await (async () => {
+        const staged = (await listChangedFiles(repo, true));
+        const unstaged = (await listChangedFiles(repo, false));
+        const allFiles = [...new Set([...staged, ...unstaged])].filter((rel) => isAllowedReadPath(config, repo, rel));
+
+        const args = ['diff', '--numstat', '--', ...allFiles];
+        const out = await gitOutput(repo, args, 'Get diff numstat');
+        const lines = out.split(/\r?\n/).filter(Boolean);
+
+        const files: Array<{ path: string; added: number; deleted: number }> = [];
+        for (const line of lines) {
+          const parts = line.split('\t');
+          if (parts.length >= 3) {
+            const added = parts[0] === '-' ? 0 : parseInt(parts[0], 10);
+            const deleted = parts[1] === '-' ? 0 : parseInt(parts[1], 10);
+            files.push({ path: parts[2], added, deleted });
+          }
+        }
+        return files;
+      })();
+
+      const branch = await currentBranch(repo);
+      const defaultTitle = customTitle || `feat: update ${branch.replace('feat/', '').replace(/-/g, ' ')}`;
+
+      const fileSummary = diffSummary
+        .map((f) => `- \`${f.path}\`: +${f.added} -${f.deleted}`)
+        .join('\n');
+
+      const totalAdded = diffSummary.reduce((sum, f) => sum + f.added, 0);
+      const totalDeleted = diffSummary.reduce((sum, f) => sum + f.deleted, 0);
+
+      const body = `## Summary
+
+${fileSummary || '- No file changes detected.'}
+
+Total: +${totalAdded} -${totalDeleted} lines
+
+## Test Plan
+
+- npm run typecheck
+- npm test
+- npm run build
+
+## Safety
+
+- No git push was performed by MCP.
+- Human review required before pushing.`;
+
+      return result({ title: defaultTitle, body });
+    },
+  );
+
+  server.registerTool(
+    'git_diff_summary',
+    {
+      title: 'Show structured diff summary',
+      description: 'Use this to get a structured summary of changes (lines added/deleted) before committing.',
+      inputSchema: {
+        repo: z.string(),
+        staged: z.boolean().default(false),
+        paths: z.array(z.string()).default([]),
+      },
+      outputSchema: {
+        repo: z.string(),
+        files: z.array(z.object({
+          path: z.string(),
+          added: z.number(),
+          deleted: z.number(),
+        })),
+        riskHints: z.array(z.string()),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName, staged = false, paths = [] }) => {
+      const repo = getRepo(config, repos, repoName);
+      const selectedFiles = paths.length
+        ? paths.map((p) => ensurePathAllowed(config, repo, p, 'read'))
+        : (await listChangedFiles(repo, staged)).filter((rel) => isAllowedReadPath(config, repo, rel));
+
+      if (selectedFiles.length === 0) {
+        return result({ repo: repo.name, files: [], riskHints: ['No changes detected.'] });
+      }
+
+      const args = staged ? ['diff', '--cached', '--numstat', '--', ...selectedFiles] : ['diff', '--numstat', '--', ...selectedFiles];
+      const out = await gitOutput(repo, args, 'Get diff numstat');
+      const lines = out.split(/\r?\n/).filter(Boolean);
+
+      const files: Array<{ path: string; added: number; deleted: number }> = [];
+      for (const line of lines) {
+        const parts = line.split('\t');
+        if (parts.length >= 3) {
+          const added = parts[0] === '-' ? 0 : parseInt(parts[0], 10);
+          const deleted = parts[1] === '-' ? 0 : parseInt(parts[1], 10);
+          files.push({ path: parts[2], added, deleted });
+        }
+      }
+
+      const riskHints: string[] = [];
+      riskHints.push('No remote operation detected.');
+      riskHints.push('No denied path modified.');
+
+      const hasLargeChange = files.some((f) => f.added + f.deleted > 500);
+      if (hasLargeChange) {
+        riskHints.push('Large changes detected. Review carefully before committing.');
+      }
+
+      riskHints.push('Review changes before git_add/git_commit.');
+
+      return result({ repo: repo.name, files, riskHints });
+    },
+  );
+
+  server.registerTool(
+    'list_backups',
+    {
+      title: 'List backups for a repo',
+      description: 'Use this to see available backups before calling restore_backup.',
+      inputSchema: { repo: z.string() },
+      outputSchema: {
+        repo: z.string(),
+        backups: z.array(z.object({
+          id: z.string(),
+          path: z.string(),
+          files: z.array(z.string()),
+        })),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName }) => {
+      const repo = getRepo(config, repos, repoName);
+      const backupRoot = path.join(repo.absPath, '.chatgpt-git-mcp', 'backups');
+      const backups: Array<{ id: string; path: string; files: string[] }> = [];
+
+      if (!fs.existsSync(backupRoot)) {
+        return result({ repo: repo.name, backups });
+      }
+
+      const entries = fs.readdirSync(backupRoot, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const backupPath = path.join(backupRoot, entry.name);
+        const files = walkFiles(config, repo, path.join('.chatgpt-git-mcp', 'backups', entry.name), 1000);
+        backups.push({
+          id: entry.name,
+          path: path.join('.chatgpt-git-mcp', 'backups', entry.name),
+          files,
+        });
+      }
+
+      backups.sort((a, b) => b.id.localeCompare(a.id));
+      return result({ repo: repo.name, backups });
+    },
+  );
+
+  server.registerTool(
+    'restore_backup',
+    {
+      title: 'Restore files from a backup',
+      description: 'Use this to restore files from a previous backup. Current files will be backed up first.',
+      inputSchema: {
+        repo: z.string(),
+        backupId: z.string(),
+        paths: z.array(z.string()).optional(),
+      },
+      outputSchema: {
+        repo: z.string(),
+        restoredPaths: z.array(z.string()),
+        backupPath: z.string().nullable(),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+    async ({ repo: repoName, backupId, paths }) => {
+      const repo = getRepo(config, repos, repoName);
+
+      if (backupId.includes('..') || backupId.includes('/') || backupId.includes('\\')) {
+        throw new UserFacingError('Invalid backupId: path traversal is not allowed.');
+      }
+
+      const backupDir = path.join(repo.absPath, '.chatgpt-git-mcp', 'backups', backupId);
+      if (!fs.existsSync(backupDir) || !fs.statSync(backupDir).isDirectory()) {
+        throw new UserFacingError(`Backup '${backupId}' not found.`);
+      }
+
+      const filesToRestore = paths ?? walkFiles(config, repo, path.join('.chatgpt-git-mcp', 'backups', backupId), 1000);
+
+      for (const rel of filesToRestore) {
+        const normalized = rel.replace(/^\.chatgpt-git-mcp\/backups\/[^/]+\//, '');
+        try {
+          ensurePathAllowed(config, repo, normalized, 'write');
+        } catch {
+          throw new UserFacingError(`Cannot restore '${normalized}': path not allowed for write.`);
+        }
+      }
+
+      const currentFiles = filesToRestore.map((rel) => rel.replace(/^\.chatgpt-git-mcp\/backups\/[^/]+\//, ''));
+      const backupPath = makeBackup(repo, currentFiles);
+
+      for (const rel of filesToRestore) {
+        const normalized = rel.replace(/^\.chatgpt-git-mcp\/backups\/[^/]+\//, '');
+        const src = path.join(repo.absPath, rel);
+        const dst = path.join(repo.absPath, normalized);
+        if (fs.existsSync(src)) {
+          fs.mkdirSync(path.dirname(dst), { recursive: true });
+          fs.copyFileSync(src, dst);
+        }
+      }
+
+      const branch = await currentBranch(repo);
+      audit(repo, 'restore_backup', true, currentFiles, undefined, branch);
+
+      return result({
+        repo: repo.name,
+        restoredPaths: currentFiles,
+        backupPath,
       });
     },
   );

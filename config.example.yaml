@@ -23,6 +23,10 @@ security:
     - secrets
     - node_modules
     - __pycache__
+  # Branches where write operations are blocked. Create a feature branch first.
+  protectedBranches:
+    - main
+    - master
 
 # Optional. If set, requests must include Authorization: Bearer <token>.
 # ChatGPT custom apps usually work best with OAuth or no-auth + private tunnel/reverse proxy,
@@ -37,3 +41,27 @@ reposDir: /www/code
 
 # Explicitly defined repos (optional, overrides reposDir settings for same name)
 repos: {}
+  # Example with allowedTasks:
+  # chatgpt-local-git-mcp:
+  #   path: /www/code/chatgpt-local-git-mcp
+  #   allowedReadPaths:
+  #     - .
+  #   allowedWritePaths:
+  #     - src
+  #     - tests
+  #     - docs
+  #     - README.md
+  #     - package.json
+  #     - tsconfig.json
+  #     - tsconfig.test.json
+  #     - config.example.yaml
+  #   allowedTasks:
+  #     typecheck:
+  #       description: Run TypeScript checks.
+  #       command: ["npm", "run", "typecheck"]
+  #     test:
+  #       description: Run unit tests.
+  #       command: ["npm", "test"]
+  #     build:
+  #       description: Build the project.
+  #       command: ["npm", "run", "build"]
