@@ -116,6 +116,30 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
   );
 
   server.registerTool(
+    'list_tasks',
+    {
+      title: 'List whitelisted repo tasks',
+      description: 'Use this to discover safe task keys configured for a repo before calling run_task.',
+      inputSchema: { repo: z.string() },
+      outputSchema: {
+        repo: z.string(),
+        tasks: z.array(z.object({
+          name: z.string(),
+          description: z.string().optional(),
+          command: z.array(z.string()),
+          timeoutMs: z.number().optional(),
+        })),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName }) => {
+      const repo = getRepo(config, repos, repoName);
+      const tasks = Object.entries(repo.allowedTasks ?? {}).map(([name, task]) => ({ name, ...task }));
+      return result({ repo: repo.name, tasks });
+    },
+  );
+
+  server.registerTool(
     'repo_tree',
     {
       title: 'List files in a repo',
