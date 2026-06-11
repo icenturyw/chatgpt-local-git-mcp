@@ -16,10 +16,14 @@ import {
 } from './security.js';
 import {
   assertSuccess,
+  branchExists,
   currentBranch,
   currentHead,
+  diffSummary,
   git,
   gitOutput,
+  listBranches,
+  mergeBase,
   runCommand,
   shellQuote,
   validateBranchName,
@@ -289,22 +293,113 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
   );
 
   server.registerTool(
+    'read_file_around_match',
+    {
+      title: 'Read file context around a text match',
+      description: 'Use this to read a file around a specific text match, providing context lines before and after.',
+      inputSchema: {
+        repo: z.string(),
+        path: z.string().describe('Repo-relative file path.'),
+        query: z.string().describe('Text to search for in the file.'),
+        contextLines: z.number().int().min(1).max(50).default(10).describe('Number of lines of context before and after the match.'),
+        maxMatches: z.number().int().min(1).max(10).default(3).describe('Maximum number of matches to return context for.'),
+      },
+      outputSchema: {
+        repo: z.string(),
+        path: z.string(),
+        query: z.string(),
+        matches: z.array(z.object({
+          line: z.number(),
+          preview: z.string(),
+          context: z.string(),
+        })),
+        truncated: z.boolean(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName, path: relInput, query, contextLines = 10, maxMatches = 3 }) => {
+      const repo = getRepo(config, repos, repoName);
+      const rel = ensurePathAllowed(config, repo, relInput, 'read');
+      const abs = path.join(repo.absPath, rel);
+
+      const buffer = ensureTextFileReadable(abs, config.security.maxReadBytes);
+      const text = buffer.toString('utf8');
+      const lines = text.split(/\r?\n/);
+
+      const matches: Array<{ line: number; preview: string; context: string }> = [];
+      const needle = query.toLowerCase();
+
+      for (let i = 0; i < lines.length && matches.length < maxMatches; i++) {
+        if (lines[i].toLowerCase().includes(needle)) {
+          const startLine = Math.max(0, i - contextLines);
+          const endLine = Math.min(lines.length - 1, i + contextLines);
+          const context = lines.slice(startLine, endLine + 1).join('\n');
+          matches.push({
+            line: i + 1,
+            preview: lines[i].trim(),
+            context,
+          });
+        }
+      }
+
+      return result({
+        repo: repo.name,
+        path: rel,
+        query,
+        matches,
+        truncated: matches.length >= maxMatches && lines.some((line, idx) => idx > matches[matches.length - 1]?.line && line.toLowerCase().includes(needle)),
+      });
+    },
+  );
+
+  server.registerTool(
     'git_status',
     {
       title: 'Show Git status',
-      description: 'Use this when you need the current branch, HEAD and short Git status for a configured repo.',
+      description: 'Use this when you need the current branch, HEAD and short Git status for a configured repo. Filters out .chatgpt-git-mcp backup directory changes.',
       inputSchema: { repo: z.string() },
-      outputSchema: { repo: z.string(), branch: z.string(), head: z.string(), status: z.string() },
+      outputSchema: {
+        repo: z.string(),
+        branch: z.string(),
+        head: z.string(),
+        status: z.string(),
+        mcpGenerated: z.array(z.string()),
+        cleanIgnoringMcpGenerated: z.boolean(),
+      },
       annotations: { readOnlyHint: true },
     },
     async ({ repo: repoName }) => {
       const repo = getRepo(config, repos, repoName);
-      const [branch, head, status] = await Promise.all([
+      const [branch, head, rawStatus] = await Promise.all([
         currentBranch(repo),
         currentHead(repo),
         gitOutput(repo, ['status', '--short'], 'Get git status'),
       ]);
-      return result({ repo: repo.name, branch, head, status });
+
+      const statusLines = rawStatus.split(/\r?\n/).filter(Boolean);
+      const mcpGenerated: string[] = [];
+      const filteredLines: string[] = [];
+
+      for (const line of statusLines) {
+        const filePath = line.slice(3).trim();
+        if (filePath.startsWith('.chatgpt-git-mcp/') || filePath.startsWith('.chatgpt-git-mcp\\')) {
+          mcpGenerated.push(filePath);
+        } else {
+          filteredLines.push(line);
+        }
+      }
+
+      const status = filteredLines.join('\n');
+      const cleanIgnoringMcpGenerated = filteredLines.length === 0;
+
+      return result({
+        repo: repo.name,
+        branch,
+        head,
+        status,
+        mcpGenerated,
+        cleanIgnoringMcpGenerated,
+      });
     },
   );
 
@@ -358,6 +453,193 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       const switched = await git(repo, args);
       assertSuccess(switched, 'Create local branch');
       return result({ repo: repo.name, branch: await currentBranch(repo), previousBranch, head: await currentHead(repo) });
+    },
+  );
+
+  server.registerTool(
+    'git_switch',
+    {
+      title: 'Switch to an existing local branch',
+      description: 'Use this to switch to an existing local branch. This does not create or push to any remote.',
+      inputSchema: {
+        repo: z.string(),
+        branch: z.string().describe('Existing local branch name to switch to.'),
+      },
+      outputSchema: { repo: z.string(), branch: z.string(), previousBranch: z.string(), head: z.string() },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+    async ({ repo: repoName, branch }) => {
+      const repo = getRepo(config, repos, repoName);
+      validateBranchName(branch);
+      const previousBranch = await currentBranch(repo);
+      if (previousBranch === branch) {
+        throw new UserFacingError(`Already on branch '${branch}'.`);
+      }
+      const exists = await branchExists(repo, branch);
+      if (!exists) {
+        throw new UserFacingError(`Branch '${branch}' does not exist. Use create_branch to create it first.`);
+      }
+      const switched = await git(repo, ['switch', branch]);
+      assertSuccess(switched, 'Switch branch');
+      return result({ repo: repo.name, branch: await currentBranch(repo), previousBranch, head: await currentHead(repo) });
+    },
+  );
+
+  server.registerTool(
+    'prepare_merge',
+    {
+      title: 'Prepare merge analysis',
+      description: 'Use this to analyze if a source branch can be merged into a target branch without conflicts.',
+      inputSchema: {
+        repo: z.string(),
+        targetBranch: z.string().describe('Branch to merge into (e.g., main).'),
+        sourceBranch: z.string().describe('Branch to merge from (e.g., feature branch).'),
+      },
+      outputSchema: {
+        repo: z.string(),
+        targetBranch: z.string(),
+        sourceBranch: z.string(),
+        canMerge: z.boolean(),
+        mergeBase: z.string(),
+        ahead: z.number(),
+        behind: z.number(),
+        diffSummary: z.array(z.object({ path: z.string(), added: z.number(), deleted: z.number() })),
+        conflicts: z.array(z.string()),
+        suggestion: z.string(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName, targetBranch, sourceBranch }) => {
+      const repo = getRepo(config, repos, repoName);
+      validateBranchName(targetBranch);
+      validateBranchName(sourceBranch);
+
+      const targetExists = await branchExists(repo, targetBranch);
+      if (!targetExists) {
+        throw new UserFacingError(`Target branch '${targetBranch}' does not exist.`);
+      }
+
+      const sourceExists = await branchExists(repo, sourceBranch);
+      if (!sourceExists) {
+        throw new UserFacingError(`Source branch '${sourceBranch}' does not exist.`);
+      }
+
+      const base = await mergeBase(repo, targetBranch, sourceBranch);
+      const [targetHead, sourceHead] = await Promise.all([
+        gitOutput(repo, ['rev-parse', targetBranch], 'Get target HEAD'),
+        gitOutput(repo, ['rev-parse', sourceBranch], 'Get source HEAD'),
+      ]);
+
+      const aheadResult = await git(repo, ['rev-list', '--count', `${base}..${sourceHead.trim()}`]);
+      const behindResult = await git(repo, ['rev-list', '--count', `${base}..${targetHead.trim()}`]);
+
+      const ahead = parseInt(aheadResult.stdout.trim(), 10) || 0;
+      const behind = parseInt(behindResult.stdout.trim(), 10) || 0;
+
+      const diff = await diffSummary(repo, targetBranch, sourceBranch);
+
+      const checkResult = await git(repo, ['merge-tree', base, targetBranch, sourceBranch]);
+      const hasConflicts = checkResult.code !== 0 || checkResult.stderr.includes('CONFLICT');
+
+      const conflicts: string[] = [];
+      if (hasConflicts) {
+        const conflictLines = checkResult.stdout.split(/\r?\n/).filter((line) => line.includes('CONFLICT'));
+        conflicts.push(...conflictLines.slice(0, 10));
+      }
+
+      const canMerge = !hasConflicts;
+      let suggestion = '';
+      if (canMerge) {
+        suggestion = `Branch '${sourceBranch}' can be merged into '${targetBranch}'. Use git_merge to perform the merge.`;
+      } else {
+        suggestion = `Merge conflict detected. Resolve conflicts manually before merging.`;
+      }
+
+      return result({
+        repo: repo.name,
+        targetBranch,
+        sourceBranch,
+        canMerge,
+        mergeBase: base,
+        ahead,
+        behind,
+        diffSummary: diff.files,
+        conflicts,
+        suggestion,
+      });
+    },
+  );
+
+  server.registerTool(
+    'git_merge',
+    {
+      title: 'Merge a branch into current branch',
+      description: 'Use this to merge a source branch into the current branch. Use prepare_merge first to check for conflicts.',
+      inputSchema: {
+        repo: z.string(),
+        sourceBranch: z.string().describe('Branch to merge from.'),
+        message: z.string().optional().describe('Optional merge commit message.'),
+      },
+      outputSchema: {
+        repo: z.string(),
+        sourceBranch: z.string(),
+        targetBranch: z.string(),
+        commit: z.string().nullable(),
+        status: z.string(),
+        conflicts: z.array(z.string()),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+    async ({ repo: repoName, sourceBranch, message }) => {
+      const repo = getRepo(config, repos, repoName);
+      validateBranchName(sourceBranch);
+      await ensureWritableBranch(config, repo, 'git_merge');
+
+      const sourceExists = await branchExists(repo, sourceBranch);
+      if (!sourceExists) {
+        throw new UserFacingError(`Source branch '${sourceBranch}' does not exist.`);
+      }
+
+      const targetBranch = await currentBranch(repo);
+      if (targetBranch === sourceBranch) {
+        throw new UserFacingError(`Cannot merge branch '${sourceBranch}' into itself.`);
+      }
+
+      const args = ['merge', sourceBranch];
+      if (message) {
+        args.push('-m', validateCommitMessage(message));
+      }
+
+      const mergeResult = await git(repo, args, config.security.commandTimeoutMs);
+
+      if (mergeResult.code !== 0) {
+        const conflictOutput = mergeResult.stdout + mergeResult.stderr;
+        const conflictLines = conflictOutput.split(/\r?\n/).filter((line) => line.includes('CONFLICT'));
+        const conflicts = conflictLines.slice(0, 10);
+
+        audit(repo, 'git_merge', false, undefined, `Merge failed: ${mergeResult.stderr}`, targetBranch);
+
+        return result({
+          repo: repo.name,
+          sourceBranch,
+          targetBranch,
+          commit: null,
+          status: `merge failed: ${mergeResult.stderr}`,
+          conflicts,
+        });
+      }
+
+      const commit = await currentHead(repo);
+      audit(repo, 'git_merge', true, undefined, undefined, targetBranch);
+
+      return result({
+        repo: repo.name,
+        sourceBranch,
+        targetBranch,
+        commit,
+        status: 'merged',
+        conflicts: [],
+      });
     },
   );
 
@@ -625,6 +907,94 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
   );
 
   server.registerTool(
+    'replace_in_file',
+    {
+      title: 'Replace text in a file with multiple patterns',
+      description: 'Use this to replace multiple text patterns in a file in a single operation. More efficient than multiple replace_text calls.',
+      inputSchema: {
+        repo: z.string(),
+        path: z.string(),
+        replacements: z.array(z.object({
+          oldText: z.string().min(1),
+          newText: z.string(),
+        })).min(1).max(10),
+        expected_sha256: z.string().optional(),
+      },
+      outputSchema: {
+        repo: z.string(),
+        path: z.string(),
+        sha256: z.string(),
+        bytes: z.number(),
+        backupPath: z.string().nullable(),
+        totalReplacements: z.number(),
+        replacementDetails: z.array(z.object({
+          oldText: z.string(),
+          newText: z.string(),
+          count: z.number(),
+        })),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+    async ({ repo: repoName, path: relInput, replacements, expected_sha256 }) => {
+      const repo = getRepo(config, repos, repoName);
+      await ensureWritableBranch(config, repo, 'replace_in_file');
+      const rel = ensurePathAllowed(config, repo, relInput, 'write');
+      const abs = path.join(repo.absPath, rel);
+
+      if (!fs.existsSync(abs)) {
+        throw new UserFacingError(`File '${rel}' does not exist. Use write_file to create it.`);
+      }
+
+      const buffer = ensureTextFileReadable(abs, config.security.maxReadBytes);
+      let content = buffer.toString('utf8');
+
+      if (config.security.requireExpectedShaForOverwrite && !expected_sha256) {
+        const currentSha = sha256Buffer(buffer);
+        throw new UserFacingError(`expected_sha256 is required to overwrite '${rel}'. Call read_file first. Current sha256: ${currentSha}`);
+      }
+
+      if (expected_sha256) {
+        const currentSha = sha256Buffer(buffer);
+        if (expected_sha256 !== currentSha) {
+          throw new UserFacingError(`sha256 mismatch for '${rel}'. Current=${currentSha}, expected=${expected_sha256}. Re-read the file before writing.`);
+        }
+      }
+
+      const replacementDetails: Array<{ oldText: string; newText: string; count: number }> = [];
+      let totalReplacements = 0;
+
+      for (const replacement of replacements) {
+        const count = content.split(replacement.oldText).length - 1;
+        if (count === 0) {
+          throw new UserFacingError(`oldText '${replacement.oldText.slice(0, 50)}...' not found in '${rel}'.`);
+        }
+        content = content.split(replacement.oldText).join(replacement.newText);
+        replacementDetails.push({
+          oldText: replacement.oldText,
+          newText: replacement.newText,
+          count,
+        });
+        totalReplacements += count;
+      }
+
+      const backupPath = makeBackup(repo, [rel]);
+      fs.writeFileSync(abs, content, 'utf8');
+      const branch = await currentBranch(repo);
+      audit(repo, 'replace_in_file', true, [rel], undefined, branch);
+
+      return result({
+        repo: repo.name,
+        path: rel,
+        sha256: sha256Text(content),
+        bytes: Buffer.byteLength(content, 'utf8'),
+        backupPath,
+        totalReplacements,
+        replacementDetails,
+      });
+    },
+  );
+
+  server.registerTool(
     'validate_patch',
     {
       title: 'Validate a unified diff patch',
@@ -772,6 +1142,113 @@ Total: +${totalAdded} -${totalDeleted} lines
 - Human review required before pushing.`;
 
       return result({ title: defaultTitle, body });
+    },
+  );
+
+  server.registerTool(
+    'git_workflow_status',
+    {
+      title: 'Show comprehensive workflow status',
+      description: 'Use this to get a complete overview of the current workflow state, including branch info, pending changes, staged files, and recent commits.',
+      inputSchema: { repo: z.string() },
+      outputSchema: {
+        repo: z.string(),
+        branch: z.string(),
+        head: z.string(),
+        isProtected: z.boolean(),
+        hasPendingChanges: z.boolean(),
+        hasStagedChanges: z.boolean(),
+        stagedFiles: z.array(z.string()),
+        unstagedFiles: z.array(z.string()),
+        untrackedFiles: z.array(z.string()),
+        mcpGeneratedFiles: z.array(z.string()),
+        recentCommits: z.array(z.object({
+          hash: z.string(),
+          message: z.string(),
+          date: z.string(),
+        })),
+        suggestions: z.array(z.string()),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName }) => {
+      const repo = getRepo(config, repos, repoName);
+      const branch = await currentBranch(repo);
+      const head = await currentHead(repo);
+      const isProtected = isProtectedBranch(branch, config.security.protectedBranches);
+
+      const [statusOutput, logOutput] = await Promise.all([
+        gitOutput(repo, ['status', '--porcelain'], 'Get status'),
+        gitOutput(repo, ['log', '--oneline', '-5', '--format=%h %s %cr'], 'Get recent commits'),
+      ]);
+
+      const statusLines = statusOutput.split(/\r?\n/).filter(Boolean);
+      const stagedFiles: string[] = [];
+      const unstagedFiles: string[] = [];
+      const untrackedFiles: string[] = [];
+      const mcpGeneratedFiles: string[] = [];
+
+      for (const line of statusLines) {
+        const statusCode = line.slice(0, 2).trim();
+        const filePath = line.slice(3).trim();
+
+        if (filePath.startsWith('.chatgpt-git-mcp/') || filePath.startsWith('.chatgpt-git-mcp\\')) {
+          mcpGeneratedFiles.push(filePath);
+          continue;
+        }
+
+        if (statusCode.includes('?')) {
+          untrackedFiles.push(filePath);
+        } else {
+          if (statusCode[0] !== ' ' && statusCode[0] !== '?') {
+            stagedFiles.push(filePath);
+          }
+          if (statusCode[1] !== ' ' && statusCode[1] !== '?') {
+            unstagedFiles.push(filePath);
+          }
+        }
+      }
+
+      const recentCommits = logOutput.split(/\r?\n/).filter(Boolean).map((line) => {
+        const parts = line.split(' ');
+        return {
+          hash: parts[0] || '',
+          message: parts.slice(1, -1).join(' ') || '',
+          date: parts[parts.length - 1] || '',
+        };
+      });
+
+      const hasPendingChanges = unstagedFiles.length > 0 || untrackedFiles.length > 0;
+      const hasStagedChanges = stagedFiles.length > 0;
+
+      const suggestions: string[] = [];
+      if (isProtected) {
+        suggestions.push('Current branch is protected. Create a feature branch for changes.');
+      }
+      if (hasPendingChanges && !hasStagedChanges) {
+        suggestions.push('You have pending changes. Use git_add to stage files before committing.');
+      }
+      if (hasStagedChanges) {
+        suggestions.push('You have staged changes. Use git_commit to create a commit.');
+      }
+      if (!hasPendingChanges && !hasStagedChanges) {
+        suggestions.push('Working directory is clean. Ready for new changes.');
+      }
+
+      return result({
+        repo: repo.name,
+        branch,
+        head,
+        isProtected,
+        hasPendingChanges,
+        hasStagedChanges,
+        stagedFiles,
+        unstagedFiles,
+        untrackedFiles,
+        mcpGeneratedFiles,
+        recentCommits,
+        suggestions,
+      });
     },
   );
 

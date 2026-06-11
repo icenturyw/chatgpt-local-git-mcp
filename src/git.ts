@@ -112,3 +112,37 @@ export function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
+
+export async function listBranches(repo: RepoRuntime, pattern?: string): Promise<string[]> {
+  const args = ['branch', '--list'];
+  if (pattern) args.push(pattern);
+  const out = await gitOutput(repo, args, 'List branches');
+  return out.split(/\r?\n/).map((line) => line.replace(/^\*\s+/, '').trim()).filter(Boolean);
+}
+
+export async function branchExists(repo: RepoRuntime, branch: string): Promise<boolean> {
+  const result = await git(repo, ['rev-parse', '--verify', branch]);
+  return result.code === 0;
+}
+
+export async function mergeBase(repo: RepoRuntime, commit1: string, commit2: string): Promise<string> {
+  const out = await gitOutput(repo, ['merge-base', commit1, commit2], 'Find merge base');
+  return out.trim();
+}
+
+export async function diffSummary(repo: RepoRuntime, from: string, to: string): Promise<{ files: Array<{ path: string; added: number; deleted: number }> }> {
+  const out = await gitOutput(repo, ['diff', '--numstat', `${from}...${to}`], 'Get diff summary');
+  const lines = out.split(/\r?\n/).filter(Boolean);
+  const files: Array<{ path: string; added: number; deleted: number }> = [];
+
+  for (const line of lines) {
+    const parts = line.split('\t');
+    if (parts.length >= 3) {
+      const added = parts[0] === '-' ? 0 : parseInt(parts[0], 10);
+      const deleted = parts[1] === '-' ? 0 : parseInt(parts[1], 10);
+      files.push({ path: parts[2], added, deleted });
+    }
+  }
+
+  return { files };
+}

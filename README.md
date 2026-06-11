@@ -25,22 +25,28 @@
 | `list_tasks` | 查看仓库的白名单任务 |
 | `repo_tree` | 查看仓库文件列表，自动过滤敏感路径 |
 | `read_file` | 读取文本文件，返回 `sha256` 用于安全覆盖 |
+| `read_file_around_match` | 在文件中搜索文本并返回上下文 |
 | `search_code` | 搜索代码文本 |
-| `git_status` | 查看当前分支、HEAD、短状态 |
+| `git_status` | 查看当前分支、HEAD、短状态（过滤备份目录） |
 | `git_diff` | 查看改动 diff，提交前审查用 |
 | `git_diff_summary` | 查看结构化 diff 摘要（增删行数） |
+| `git_workflow_status` | 查看完整工作流状态（分支、更改、提交历史） |
 | `prepare_push` | 只生成 push 命令，不执行 |
 | `prepare_pr_text` | 生成 PR 标题和内容文案 |
+| `prepare_merge` | 分支合并分析（冲突检测、差异摘要） |
 
 ### 写入/执行工具
 
 | 工具 | 作用 | 是否会 push |
 |---|---|---:|
 | `create_branch` | 创建并切换本地分支 | 否 |
+| `git_switch` | 切换到已有本地分支 | 否 |
 | `write_file` | 写入允许路径下的文本文件 | 否 |
 | `replace_text` | 安全替换文件中的文本 | 否 |
+| `replace_in_file` | 批量替换文件中的多个文本模式 | 否 |
 | `apply_patch` | 应用 unified diff patch | 否 |
 | `validate_patch` | 诊断 patch 是否可应用 | 否 |
+| `git_merge` | 合并分支到当前分支 | 否 |
 | `run_task` | 执行白名单任务，比如测试/构建 | 否 |
 | `git_add` | stage 指定允许文件 | 否 |
 | `git_commit` | 创建本地 commit | 否 |
