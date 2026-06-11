@@ -1,0 +1,15 @@
+services:
+  chatgpt-local-git-mcp:
+    build: .
+    container_name: chatgpt-local-git-mcp
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Optional. Only enable if your MCP client/reverse proxy can send Authorization header.
+      # MCP_AUTH_TOKEN: "change-me-long-random-token"
+      CONFIG_PATH: "/app/config.yaml"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      # Mount your repos read-write. Make sure config.yaml paths match these container paths.
+      - /opt/repos:/opt/repos

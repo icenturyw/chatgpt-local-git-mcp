@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+config.yaml
+.chatgpt-git-mcp/
+*.log
+.DS_Store

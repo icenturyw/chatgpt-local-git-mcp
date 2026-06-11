@@ -1,0 +1,39 @@
+server:
+  host: 0.0.0.0
+  port: 3000
+  # Optional URL path. Using a random-looking path is recommended when running without OAuth.
+  mcpPath: /mcp
+  maxRequestBodyBytes: 2097152
+
+security:
+  # If true, overwriting an existing file requires expected_sha256 from read_file.
+  requireExpectedShaForOverwrite: true
+  maxReadBytes: 262144
+  maxWriteBytes: 262144
+  commandTimeoutMs: 120000
+  # Extra denied file names/patterns applied to every repo.
+  globalDeniedPaths:
+    - .git
+    - .env
+    - .env.*
+    - id_rsa
+    - id_ed25519
+    - '*.pem'
+    - '*.key'
+    - secrets
+    - node_modules
+    - __pycache__
+
+# Optional. If set, requests must include Authorization: Bearer <token>.
+# ChatGPT custom apps usually work best with OAuth or no-auth + private tunnel/reverse proxy,
+# so leave this empty unless your MCP client can send the header.
+auth:
+  bearerTokenEnv: MCP_AUTH_TOKEN
+
+# Auto-discover all Git repos in this directory.
+# Auto-discovered repos get read/write access by default (with sensible denied paths).
+# Explicitly defined repos below will override auto-discovered ones with the same name.
+reposDir: /www/code
+
+# Explicitly defined repos (optional, overrides reposDir settings for same name)
+repos: {}
