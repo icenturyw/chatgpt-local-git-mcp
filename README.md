@@ -24,6 +24,7 @@
 | `list_repos` | 查看配置里的仓库 |
 | `list_tasks` | 查看仓库的白名单任务 |
 | `repo_tree` | 查看仓库文件列表，自动过滤敏感路径 |
+| `read_project_context` | 安全读取项目上下文包，帮助 ChatGPT 快速理解项目结构和关键文件 |
 | `read_file` | 读取文本文件，返回 `sha256` 用于安全覆盖 |
 | `read_file_around_match` | 在文件中搜索文本并返回上下文 |
 | `search_code` | 搜索代码文本 |
@@ -154,6 +155,7 @@ https://xxxx.ngrok.app/mcp
 list_repos
 git_status
 list_tasks
+read_project_context
 run_task typecheck
 run_task test
 run_task build
@@ -237,7 +239,7 @@ server {
 1. ChatGPT 调 list_repos
 2. ChatGPT 调 git_status
 3. ChatGPT 调 create_branch
-4. ChatGPT 调 repo_tree / search_code / read_file
+4. ChatGPT 调 read_project_context / repo_tree / search_code / read_file
 5. ChatGPT 调 write_file 或 apply_patch
 6. ChatGPT 调 run_task
 7. ChatGPT 调 git_diff 展示给你审查

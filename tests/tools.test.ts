@@ -26,3 +26,9 @@ test('REGISTERED_TOOL_NAMES includes high-level merge tools', () => {
   assert.equal(REGISTERED_TOOL_NAMES.includes('merge_workflow_status'), true);
   assert.equal(REGISTERED_TOOL_NAMES.includes('git_merge_to_target'), true);
 });
+
+test('REGISTERED_TOOL_NAMES includes read_project_context after repo_tree', () => {
+  assert.equal(REGISTERED_TOOL_NAMES.includes('read_project_context'), true);
+  assert.equal(REGISTERED_TOOL_NAMES.indexOf('read_project_context'), REGISTERED_TOOL_NAMES.indexOf('repo_tree') + 1);
+  assert.equal(REGISTERED_TOOL_NAMES.indexOf('read_file'), REGISTERED_TOOL_NAMES.indexOf('read_project_context') + 1);
+});

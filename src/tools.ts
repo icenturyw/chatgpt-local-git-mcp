@@ -42,6 +42,7 @@ export const REGISTERED_TOOL_NAMES = [
   'list_repos',
   'list_tasks',
   'repo_tree',
+  'read_project_context',
   'read_file',
   'search_code',
   'read_file_around_match',
@@ -104,6 +105,99 @@ async function listChangedFiles(repo: RepoRuntime, staged: boolean): Promise<str
 
 export function buildRepoTreeGitArgs(prefix: string): string[] {
   return ['ls-files', '--cached', '--others', '--exclude-standard', '--', prefix === '.' ? '.' : prefix];
+}
+
+type ProjectContextMode = 'smart' | 'full' | 'summary';
+
+type ProjectContextFile = {
+  path: string;
+  bytes: number;
+  sha256: string;
+  content: string;
+};
+
+type SkippedProjectContextFile = {
+  path: string;
+  reason: string;
+};
+
+const PROJECT_CONTEXT_LOCKFILES = new Set([
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'bun.lock',
+  'bun.lockb',
+  'composer.lock',
+  'poetry.lock',
+  'pipfile.lock',
+  'cargo.lock',
+]);
+
+const PROJECT_CONTEXT_LOW_SIGNAL_DIRS = [
+  'dist',
+  'build',
+  'coverage',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  '.cache',
+  'tmp',
+  'temp',
+  'logs',
+];
+
+const PROJECT_CONTEXT_LOW_SIGNAL_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico',
+  '.pdf', '.zip', '.tar', '.gz', '.tgz', '.rar', '.7z',
+  '.mp3', '.mp4', '.mov', '.avi', '.wav', '.woff', '.woff2', '.ttf', '.otf',
+  '.sqlite', '.sqlite3', '.db', '.log', '.map',
+]);
+
+function projectContextBasename(rel: string): string {
+  return path.posix.basename(rel).toLowerCase();
+}
+
+function isProjectContextLockfile(rel: string): boolean {
+  return PROJECT_CONTEXT_LOCKFILES.has(projectContextBasename(rel));
+}
+
+function isProjectContextTestPath(rel: string): boolean {
+  const lower = rel.toLowerCase();
+  return lower.startsWith('tests/')
+    || lower.includes('/tests/')
+    || lower.includes('/__tests__/')
+    || /\.(test|spec)\.[^.]+$/.test(lower);
+}
+
+function isProjectContextDocsPath(rel: string): boolean {
+  const lower = rel.toLowerCase();
+  return lower === 'readme.md'
+    || lower.startsWith('docs/')
+    || ['.md', '.mdx', '.rst', '.txt'].includes(path.posix.extname(lower));
+}
+
+function smartProjectContextSkipReason(rel: string): string | null {
+  const lower = rel.toLowerCase();
+  const parts = lower.split('/');
+  if (parts.some((part) => PROJECT_CONTEXT_LOW_SIGNAL_DIRS.includes(part))) return 'low-signal generated directory skipped by smart mode';
+  if (PROJECT_CONTEXT_LOW_SIGNAL_EXTENSIONS.has(path.posix.extname(lower))) return 'binary or low-signal asset skipped by smart mode';
+  return null;
+}
+
+function projectContextRank(rel: string): number {
+  const lower = rel.toLowerCase();
+  const base = projectContextBasename(lower);
+  if (['package.json', 'tsconfig.json', 'tsconfig.test.json', 'config.example.yaml', 'docker-compose.yml', 'dockerfile'].includes(base)) return 0;
+  if (base === 'readme.md') return 1;
+  if (lower.startsWith('src/')) return 10;
+  if (isProjectContextTestPath(lower)) return 20;
+  if (isProjectContextDocsPath(lower)) return 30;
+  return 40;
+}
+
+function orderProjectContextFiles(files: string[], mode: ProjectContextMode): string[] {
+  if (mode !== 'smart') return files;
+  return [...files].sort((a, b) => projectContextRank(a) - projectContextRank(b) || a.localeCompare(b));
 }
 
 function walkFiles(config: AppConfig, repo: RepoRuntime, startRel: string, maxFiles: number): string[] {
@@ -572,6 +666,145 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
         .filter((rel) => isAllowedReadPath(config, repo, rel));
       const files = allFiles.slice(0, maxEntries);
       return result({ repo: repo.name, files, truncated: allFiles.length > files.length });
+    },
+  );
+
+  server.registerTool(
+    'read_project_context',
+    {
+      title: 'Read project context safely',
+      description: 'Use this to return a safe, structured snapshot of repo files for ChatGPT to understand a project. Denied paths, binary files, large files, and total output limits are enforced.',
+      inputSchema: {
+        repo: z.string().describe('Configured repo name from list_repos.'),
+        pathPrefix: z.string().default('.').describe('Optional repo-relative folder or prefix to read.'),
+        maxFiles: z.number().int().min(1).max(500).default(80).describe('Maximum number of files to include.'),
+        maxTotalBytes: z.number().int().min(1000).max(5_000_000).default(512 * 1024).describe('Maximum content bytes returned across all files.'),
+        includeTests: z.boolean().default(true).describe('Whether to include test files.'),
+        includeDocs: z.boolean().default(true).describe('Whether to include docs and markdown-like files.'),
+        includeLockfiles: z.boolean().default(false).describe('Whether to include lockfiles such as package-lock.json.'),
+        mode: z.enum(['smart', 'full', 'summary']).default('smart').describe('smart prioritizes high-signal files, full reads allowed files in git order, summary omits file content.'),
+      },
+      outputSchema: {
+        repo: z.string(),
+        pathPrefix: z.string(),
+        mode: z.enum(['smart', 'full', 'summary']),
+        filesRead: z.array(z.object({
+          path: z.string(),
+          bytes: z.number(),
+          sha256: z.string(),
+          content: z.string(),
+        })),
+        skippedFiles: z.array(z.object({
+          path: z.string(),
+          reason: z.string(),
+        })),
+        totalBytes: z.number(),
+        fileCount: z.number(),
+        truncated: z.boolean(),
+        warnings: z.array(z.string()),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({
+      repo: repoName,
+      pathPrefix = '.',
+      maxFiles = 80,
+      maxTotalBytes = 512 * 1024,
+      includeTests = true,
+      includeDocs = true,
+      includeLockfiles = false,
+      mode = 'smart',
+    }) => {
+      const repo = getRepo(config, repos, repoName);
+      const prefix = ensurePathAllowed(config, repo, pathPrefix, 'read');
+      const raw = await gitOutput(repo, buildRepoTreeGitArgs(prefix), 'List project context files');
+      const allFiles = raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      const filesRead: ProjectContextFile[] = [];
+      const skippedFiles: SkippedProjectContextFile[] = [];
+      const warnings: string[] = [];
+      let totalBytes = 0;
+      let truncated = false;
+
+      if (mode === 'smart') warnings.push('Smart mode prioritizes high-signal files and skips common generated/assets by default.');
+      if (mode === 'summary') warnings.push('Summary mode omits file content but still reports bytes and sha256.');
+
+      const candidates = orderProjectContextFiles(allFiles, mode);
+
+      for (const rel of candidates) {
+        if (filesRead.length >= maxFiles) {
+          truncated = true;
+          warnings.push('Max file count reached.');
+          break;
+        }
+
+        if (!isAllowedReadPath(config, repo, rel)) {
+          skippedFiles.push({ path: rel, reason: 'denied path' });
+          continue;
+        }
+
+        if (!includeTests && isProjectContextTestPath(rel)) {
+          skippedFiles.push({ path: rel, reason: 'tests skipped by request' });
+          continue;
+        }
+
+        if (!includeDocs && isProjectContextDocsPath(rel)) {
+          skippedFiles.push({ path: rel, reason: 'docs skipped by request' });
+          continue;
+        }
+
+        if (!includeLockfiles && isProjectContextLockfile(rel)) {
+          skippedFiles.push({ path: rel, reason: 'lockfile skipped by default' });
+          continue;
+        }
+
+        const smartSkipReason = mode === 'smart' ? smartProjectContextSkipReason(rel) : null;
+        if (smartSkipReason) {
+          skippedFiles.push({ path: rel, reason: smartSkipReason });
+          continue;
+        }
+
+        const abs = path.join(repo.absPath, rel);
+        let buffer: Buffer;
+        try {
+          buffer = ensureTextFileReadable(abs, config.security.maxReadBytes);
+        } catch (err) {
+          skippedFiles.push({ path: rel, reason: err instanceof Error ? err.message : String(err) });
+          continue;
+        }
+
+        const content = mode === 'summary' ? '' : buffer.toString('utf8');
+        const contentBytes = Buffer.byteLength(content, 'utf8');
+        if (totalBytes + contentBytes > maxTotalBytes) {
+          truncated = true;
+          skippedFiles.push({ path: rel, reason: 'maxTotalBytes limit would be exceeded' });
+          warnings.push('Max total bytes reached.');
+          break;
+        }
+
+        totalBytes += contentBytes;
+        filesRead.push({
+          path: rel,
+          bytes: buffer.length,
+          sha256: sha256Buffer(buffer),
+          content,
+        });
+      }
+
+      return result({
+        repo: repo.name,
+        pathPrefix: prefix,
+        mode,
+        filesRead,
+        skippedFiles,
+        totalBytes,
+        fileCount: filesRead.length,
+        truncated,
+        warnings: [...new Set(warnings)],
+      });
     },
   );
 

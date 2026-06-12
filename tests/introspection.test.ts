@@ -27,6 +27,7 @@ test('REGISTERED_TOOL_NAMES contains all expected tools', () => {
     'list_repos',
     'list_tasks',
     'repo_tree',
+    'read_project_context',
     'read_file',
     'search_code',
     'git_status',
