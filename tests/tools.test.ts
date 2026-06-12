@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isProtectedBranch } from '../src/tools.js';
+import { isProtectedBranch, REGISTERED_TOOL_NAMES } from '../src/tools.js';
 
 test('isProtectedBranch identifies protected branches', () => {
   const protectedBranches = ['main', 'master'];
@@ -20,4 +20,9 @@ test('isProtectedBranch handles multiple protected branches', () => {
   assert.equal(isProtectedBranch('main', protectedBranches), true);
   assert.equal(isProtectedBranch('production', protectedBranches), true);
   assert.equal(isProtectedBranch('develop', protectedBranches), false);
+});
+
+test('REGISTERED_TOOL_NAMES includes high-level merge tools', () => {
+  assert.equal(REGISTERED_TOOL_NAMES.includes('merge_workflow_status'), true);
+  assert.equal(REGISTERED_TOOL_NAMES.includes('git_merge_to_target'), true);
 });

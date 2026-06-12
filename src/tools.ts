@@ -45,6 +45,8 @@ export const REGISTERED_TOOL_NAMES = [
   'git_switch',
   'prepare_merge',
   'git_merge',
+  'merge_workflow_status',
+  'git_merge_to_target',
   'write_file',
   'apply_patch',
   'run_task',
@@ -141,6 +143,97 @@ async function ensureWritableBranch(
       `${action} is blocked on protected branch '${branch}'. Create and switch to a feature branch first.`,
     );
   }
+}
+
+type WorkingTreeStatus = {
+  stagedFiles: string[];
+  unstagedFiles: string[];
+  untrackedFiles: string[];
+  mcpGeneratedFiles: string[];
+  cleanIgnoringMcpGenerated: boolean;
+};
+
+function isCleanWorkingTree(status: WorkingTreeStatus): boolean {
+  return status.stagedFiles.length === 0
+    && status.unstagedFiles.length === 0
+    && status.untrackedFiles.length === 0;
+}
+
+function parseStatusOutput(statusOutput: string): WorkingTreeStatus {
+  const stagedFiles: string[] = [];
+  const unstagedFiles: string[] = [];
+  const untrackedFiles: string[] = [];
+
+  for (const line of statusOutput.split(/\r?\n/).filter(Boolean)) {
+    const statusCode = line.slice(0, 2);
+    const filePath = line.slice(3).trim();
+    if (statusCode.includes('?')) {
+      untrackedFiles.push(filePath);
+      continue;
+    }
+    if (statusCode[0] !== ' ' && statusCode[0] !== '?') stagedFiles.push(filePath);
+    if (statusCode[1] !== ' ' && statusCode[1] !== '?') unstagedFiles.push(filePath);
+  }
+
+  return {
+    stagedFiles,
+    unstagedFiles,
+    untrackedFiles,
+    mcpGeneratedFiles: [],
+    cleanIgnoringMcpGenerated: stagedFiles.length === 0 && unstagedFiles.length === 0 && untrackedFiles.length === 0,
+  };
+}
+
+type MergeAnalysis = {
+  mergeBase: string;
+  ahead: number;
+  behind: number;
+  diffSummary: Array<{ path: string; added: number; deleted: number }>;
+  conflicts: string[];
+  canMerge: boolean;
+};
+
+async function analyzeMerge(repo: RepoRuntime, targetBranch: string, sourceBranch: string): Promise<MergeAnalysis> {
+  validateBranchName(targetBranch);
+  validateBranchName(sourceBranch);
+
+  const targetExists = await branchExists(repo, targetBranch);
+  if (!targetExists) throw new UserFacingError(`Target branch '${targetBranch}' does not exist.`);
+
+  const sourceExists = await branchExists(repo, sourceBranch);
+  if (!sourceExists) throw new UserFacingError(`Source branch '${sourceBranch}' does not exist.`);
+
+  if (targetBranch === sourceBranch) {
+    throw new UserFacingError('targetBranch and sourceBranch must be different.');
+  }
+
+  const base = await mergeBase(repo, targetBranch, sourceBranch);
+  const [targetHead, sourceHead] = await Promise.all([
+    gitOutput(repo, ['rev-parse', targetBranch], 'Get target HEAD'),
+    gitOutput(repo, ['rev-parse', sourceBranch], 'Get source HEAD'),
+  ]);
+
+  const aheadResult = await git(repo, ['rev-list', '--count', `${base}..${sourceHead.trim()}`]);
+  const behindResult = await git(repo, ['rev-list', '--count', `${base}..${targetHead.trim()}`]);
+
+  const ahead = parseInt(aheadResult.stdout.trim(), 10) || 0;
+  const behind = parseInt(behindResult.stdout.trim(), 10) || 0;
+  const diff = await diffSummary(repo, targetBranch, sourceBranch);
+
+  const checkResult = await git(repo, ['merge-tree', base, targetBranch, sourceBranch]);
+  const conflicts = `${checkResult.stdout}\n${checkResult.stderr}`
+    .split(/\r?\n/)
+    .filter((line) => line.includes('CONFLICT'))
+    .slice(0, 20);
+
+  return {
+    mergeBase: base,
+    ahead,
+    behind,
+    diffSummary: diff.files,
+    conflicts,
+    canMerge: checkResult.code === 0 && conflicts.length === 0,
+  };
 }
 
 function audit(repo: RepoRuntime, tool: string, success: boolean, paths?: string[], error?: string, branch?: string): void {
@@ -682,6 +775,176 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
         commit,
         status: 'merged',
         conflicts: [],
+      });
+    },
+  );
+
+  server.registerTool(
+    'merge_workflow_status',
+    {
+      title: 'Show safe merge workflow status',
+      description: 'Use this before merging to check branches, conflicts, working tree cleanliness, and protected target risk.',
+      inputSchema: {
+        repo: z.string(),
+        targetBranch: z.string().describe('Branch to merge into.'),
+        sourceBranch: z.string().describe('Branch to merge from.'),
+      },
+      outputSchema: {
+        repo: z.string(),
+        currentBranch: z.string(),
+        targetBranch: z.string(),
+        sourceBranch: z.string(),
+        targetIsProtected: z.boolean(),
+        workingTreeClean: z.boolean(),
+        stagedFiles: z.array(z.string()),
+        unstagedFiles: z.array(z.string()),
+        untrackedFiles: z.array(z.string()),
+        canMerge: z.boolean(),
+        mergeBase: z.string(),
+        ahead: z.number(),
+        behind: z.number(),
+        diffSummary: z.array(z.object({ path: z.string(), added: z.number(), deleted: z.number() })),
+        conflicts: z.array(z.string()),
+        suggestions: z.array(z.string()),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName, targetBranch, sourceBranch }) => {
+      const repo = getRepo(config, repos, repoName);
+      const [current, status, analysis] = await Promise.all([
+        currentBranch(repo),
+        gitOutput(repo, ['status', '--porcelain'], 'Get status').then(parseStatusOutput),
+        analyzeMerge(repo, targetBranch, sourceBranch),
+      ]);
+
+      const targetIsProtected = isProtectedBranch(targetBranch, config.security.protectedBranches);
+      const workingTreeClean = isCleanWorkingTree(status);
+      const suggestions: string[] = [];
+
+      if (!workingTreeClean) suggestions.push('Working tree is not clean. Commit or stash changes before merging.');
+      if (targetIsProtected) suggestions.push('Target branch is protected. git_merge_to_target requires allowProtectedTarget=true.');
+      if (!analysis.canMerge) suggestions.push('Merge conflicts detected. Resolve conflicts before running git_merge_to_target.');
+      if (analysis.canMerge && workingTreeClean) suggestions.push('Merge preflight passed. Review diffSummary, then run git_merge_to_target if appropriate.');
+
+      return result({
+        repo: repo.name,
+        currentBranch: current,
+        targetBranch,
+        sourceBranch,
+        targetIsProtected,
+        workingTreeClean,
+        stagedFiles: status.stagedFiles,
+        unstagedFiles: status.unstagedFiles,
+        untrackedFiles: status.untrackedFiles,
+        canMerge: analysis.canMerge,
+        mergeBase: analysis.mergeBase,
+        ahead: analysis.ahead,
+        behind: analysis.behind,
+        diffSummary: analysis.diffSummary,
+        conflicts: analysis.conflicts,
+        suggestions,
+      });
+    },
+  );
+
+  server.registerTool(
+    'git_merge_to_target',
+    {
+      title: 'Merge source branch into target branch safely',
+      description: 'Use this to switch to a target branch and merge a source branch after merge_workflow_status passes. It never pushes.',
+      inputSchema: {
+        repo: z.string(),
+        targetBranch: z.string().describe('Branch to merge into.'),
+        sourceBranch: z.string().describe('Branch to merge from.'),
+        message: z.string().optional().describe('Optional merge commit message.'),
+        allowProtectedTarget: z.boolean().default(false).describe('Required when targetBranch is protected, such as main or master.'),
+        remote: z.string().default('origin').describe('Remote name used only to prepare a manual push command.'),
+        setUpstream: z.boolean().default(true).describe('Whether the prepared push command should include -u.'),
+      },
+      outputSchema: {
+        repo: z.string(),
+        previousBranch: z.string(),
+        currentBranch: z.string(),
+        targetBranch: z.string(),
+        sourceBranch: z.string(),
+        commit: z.string().nullable(),
+        status: z.string(),
+        conflicts: z.array(z.string()),
+        pushCommand: z.string(),
+        warning: z.string(),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+    async ({ repo: repoName, targetBranch, sourceBranch, message, allowProtectedTarget = false, remote = 'origin', setUpstream = true }) => {
+      const repo = getRepo(config, repos, repoName);
+      validateBranchName(targetBranch);
+      validateBranchName(sourceBranch);
+      if (!/^[A-Za-z0-9._-]+$/.test(remote)) throw new UserFacingError('Remote name contains unsupported characters.');
+
+      const previousBranch = await currentBranch(repo);
+      const targetIsProtected = isProtectedBranch(targetBranch, config.security.protectedBranches);
+      if (targetIsProtected && !allowProtectedTarget) {
+        throw new UserFacingError(`Target branch '${targetBranch}' is protected. Re-run with allowProtectedTarget=true after review.`);
+      }
+
+      const status = parseStatusOutput(await gitOutput(repo, ['status', '--porcelain'], 'Get status'));
+      if (!isCleanWorkingTree(status)) {
+        throw new UserFacingError('Working tree is not clean. Commit or stash changes before merging.');
+      }
+
+      const analysis = await analyzeMerge(repo, targetBranch, sourceBranch);
+      if (!analysis.canMerge) {
+        throw new UserFacingError(`Merge conflict detected: ${analysis.conflicts.join('; ') || 'unknown conflict'}`);
+      }
+
+      if (previousBranch !== targetBranch) {
+        const switched = await git(repo, ['switch', targetBranch]);
+        assertSuccess(switched, 'Switch to target branch');
+      }
+
+      const args = ['merge', sourceBranch];
+      if (message) args.push('-m', validateCommitMessage(message));
+      const mergeResult = await git(repo, args, config.security.commandTimeoutMs);
+
+      if (mergeResult.code !== 0) {
+        const conflicts = `${mergeResult.stdout}\n${mergeResult.stderr}`
+          .split(/\r?\n/)
+          .filter((line) => line.includes('CONFLICT'))
+          .slice(0, 20);
+        audit(repo, 'git_merge_to_target', false, undefined, mergeResult.stderr, targetBranch);
+        return result({
+          repo: repo.name,
+          previousBranch,
+          currentBranch: await currentBranch(repo),
+          targetBranch,
+          sourceBranch,
+          commit: null,
+          status: `merge failed: ${mergeResult.stderr}`,
+          conflicts,
+          pushCommand: '',
+          warning: 'Merge failed locally. Resolve conflicts manually before pushing.',
+        });
+      }
+
+      const pushArgs = ['push'];
+      if (setUpstream) pushArgs.push('-u');
+      pushArgs.push(remote, targetBranch);
+      const pushCommand = ['git', ...pushArgs.map(shellQuote)].join(' ');
+      const commit = await currentHead(repo);
+      const current = await currentBranch(repo);
+      audit(repo, 'git_merge_to_target', true, undefined, undefined, current);
+
+      return result({
+        repo: repo.name,
+        previousBranch,
+        currentBranch: current,
+        targetBranch,
+        sourceBranch,
+        commit,
+        status: 'merged',
+        conflicts: [],
+        pushCommand,
+        warning: 'Local merge completed. No remote push was performed. Review status and run pushCommand manually if appropriate.',
       });
     },
   );

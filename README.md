@@ -34,6 +34,7 @@
 | `prepare_push` | 只生成 push 命令，不执行 |
 | `prepare_pr_text` | 生成 PR 标题和内容文案 |
 | `prepare_merge` | 分支合并分析（冲突检测、差异摘要） |
+| `merge_workflow_status` | 高层合并前体检：工作区、受保护目标分支、冲突和 diff 摘要 |
 
 ### 写入/执行工具
 
@@ -47,6 +48,7 @@
 | `apply_patch` | 应用 unified diff patch | 否 |
 | `validate_patch` | 诊断 patch 是否可应用 | 否 |
 | `git_merge` | 合并分支到当前分支 | 否 |
+| `git_merge_to_target` | 切换到目标分支并合并源分支，输出人工 push 命令 | 否 |
 | `run_task` | 执行白名单任务，比如测试/构建 | 否 |
 | `git_add` | stage 指定允许文件 | 否 |
 | `git_commit` | 创建本地 commit | 否 |
