@@ -55,33 +55,33 @@ auth:
   bearerTokenEnv: MCP_AUTH_TOKEN
 
 # Auto-discover all Git repos in this directory.
-# Auto-discovered repos get read/write access by default (with sensible denied paths).
+# Auto-discovered Node/Bun/Yarn/pnpm repos get safe common tasks when package.json defines them:
+# typecheck, test, build.
 # Explicitly defined repos below will override auto-discovered ones with the same name.
 reposDir: /www/code
 
 # Explicitly defined repos (optional, overrides reposDir settings for same name)
-repos: {}
-  # Example with allowedTasks:
-  # chatgpt-local-git-mcp:
-  #   path: /www/code/chatgpt-local-git-mcp
-  #   allowedReadPaths:
-  #     - .
-  #   allowedWritePaths:
-  #     - src
-  #     - tests
-  #     - docs
-  #     - README.md
-  #     - package.json
-  #     - tsconfig.json
-  #     - tsconfig.test.json
-  #     - config.example.yaml
-  #   allowedTasks:
-  #     typecheck:
-  #       description: Run TypeScript checks.
-  #       command: ["npm", "run", "typecheck"]
-  #     test:
-  #       description: Run unit tests.
-  #       command: ["npm", "test"]
-  #     build:
-  #       description: Build the project.
-  #       command: ["npm", "run", "build"]
+repos:
+  chatgpt-local-git-mcp:
+    path: /www/code/chatgpt-local-git-mcp
+    allowedReadPaths:
+      - .
+    allowedWritePaths:
+      - src
+      - tests
+      - docs
+      - README.md
+      - package.json
+      - tsconfig.json
+      - tsconfig.test.json
+      - config.example.yaml
+    allowedTasks:
+      typecheck:
+        description: Run TypeScript checks.
+        command: ["npm", "run", "typecheck"]
+      test:
+        description: Run unit tests.
+        command: ["npm", "test"]
+      build:
+        description: Build the project.
+        command: ["npm", "run", "build"]

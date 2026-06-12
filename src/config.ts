@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import YAML from 'yaml';
-import type { AppConfig, RepoConfig, RepoRuntime } from './types.js';
+import type { AllowedTask, AppConfig, RepoConfig, RepoRuntime } from './types.js';
 
 const DEFAULT_CONFIG: Omit<AppConfig, 'repos'> = {
   server: {
@@ -54,6 +54,51 @@ const DEFAULT_CONFIG: Omit<AppConfig, 'repos'> = {
   },
 };
 
+const AUTO_TASK_KEYS = ['typecheck', 'test', 'build'] as const;
+
+const AUTO_TASK_DESCRIPTIONS: Record<(typeof AUTO_TASK_KEYS)[number], string> = {
+  typecheck: 'Auto-detected package.json typecheck script.',
+  test: 'Auto-detected package.json test script.',
+  build: 'Auto-detected package.json build script.',
+};
+
+function readPackageScripts(repoPath: string): Record<string, unknown> {
+  const packageJsonPath = path.join(repoPath, 'package.json');
+  if (!fs.existsSync(packageJsonPath)) return {};
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as { scripts?: unknown };
+    if (!parsed.scripts || typeof parsed.scripts !== 'object' || Array.isArray(parsed.scripts)) return {};
+    return parsed.scripts as Record<string, unknown>;
+  } catch (err) {
+    console.warn(`Failed to parse package.json at ${packageJsonPath}:`, err);
+    return {};
+  }
+}
+
+function packageManagerCommand(repoPath: string, task: (typeof AUTO_TASK_KEYS)[number]): string[] {
+  if (fs.existsSync(path.join(repoPath, 'pnpm-lock.yaml'))) return ['pnpm', 'run', task];
+  if (fs.existsSync(path.join(repoPath, 'yarn.lock'))) return ['yarn', task];
+  if (fs.existsSync(path.join(repoPath, 'bun.lockb')) || fs.existsSync(path.join(repoPath, 'bun.lock'))) return ['bun', 'run', task];
+  return task === 'test' ? ['npm', 'test'] : ['npm', 'run', task];
+}
+
+export function inferAllowedTasks(repoPath: string): Record<string, AllowedTask> {
+  const scripts = readPackageScripts(repoPath);
+  const tasks: Record<string, AllowedTask> = {};
+
+  for (const task of AUTO_TASK_KEYS) {
+    const script = scripts[task];
+    if (typeof script !== 'string' || !script.trim()) continue;
+    tasks[task] = {
+      description: AUTO_TASK_DESCRIPTIONS[task],
+      command: packageManagerCommand(repoPath, task),
+    };
+  }
+
+  return tasks;
+}
+
 function findConfigPath(): string {
   const fromEnv = process.env.CONFIG_PATH;
   if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
@@ -98,7 +143,7 @@ function discoverReposInDir(dirPath: string): Record<string, RepoConfig> {
       allowedReadPaths: ['.'],
       allowedWritePaths: ['.'],
       deniedPaths: ['.git', '.env', '.env.*', 'node_modules', '__pycache__', 'secrets'],
-      allowedTasks: {},
+      allowedTasks: inferAllowedTasks(repoPath),
     };
     console.log(`Auto-discovered repo: ${name} at ${repoPath}`);
   }

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { inferAllowedTasks } from './config.js';
 import type { AppConfig, RepoRuntime } from './types.js';
 
 export function watchReposDir(
@@ -36,7 +37,7 @@ export function watchReposDir(
         allowedReadPaths: ['.'],
         allowedWritePaths: ['.'],
         deniedPaths: ['.git', '.env', '.env.*', 'node_modules', '__pycache__', 'secrets'],
-        allowedTasks: {},
+        allowedTasks: inferAllowedTasks(repoPath),
       };
 
       repos.push(newRepo);
