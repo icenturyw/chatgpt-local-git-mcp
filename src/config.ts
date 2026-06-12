@@ -210,3 +210,7 @@ export function getRepos(config: AppConfig): RepoRuntime[] {
     allowedTasks: repo.allowedTasks ?? {},
   }));
 }
+
+export function reloadConfig(): AppConfig {
+  return loadConfig();
+}

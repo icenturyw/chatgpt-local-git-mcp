@@ -31,8 +31,14 @@ import {
   writeTempPatch,
 } from './git.js';
 import { writeAuditLog, type AuditEvent } from './audit.js';
+import { reloadConfig as reloadConfigFn, getRepos } from './config.js';
 
 export const REGISTERED_TOOL_NAMES = [
+  'list_registered_tools',
+  'config_status',
+  'list_branches',
+  'ensure_branch',
+  'reload_config',
   'list_repos',
   'list_tasks',
   'repo_tree',
@@ -49,6 +55,7 @@ export const REGISTERED_TOOL_NAMES = [
   'git_merge_to_target',
   'write_file',
   'apply_patch',
+  'edit_file_sections',
   'run_task',
   'git_add',
   'git_commit',
@@ -259,6 +266,246 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
   );
 
   server.registerTool(
+    'list_registered_tools',
+    {
+      title: 'List registered MCP tools',
+      description: 'Use this to discover which tools are currently registered in this MCP server. Useful for debugging tool visibility issues with ChatGPT.',
+      inputSchema: {},
+      outputSchema: {
+        name: z.string(),
+        version: z.string(),
+        toolCount: z.number(),
+        tools: z.array(z.string()),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async () => result({
+      name: 'chatgpt-local-git-mcp',
+      version: '0.1.0',
+      toolCount: REGISTERED_TOOL_NAMES.length,
+      tools: [...REGISTERED_TOOL_NAMES],
+    }),
+  );
+
+  server.registerTool(
+    'config_status',
+    {
+      title: 'Show current configuration status',
+      description: 'Use this to see which config file is being used, what repos are configured, and what tasks are available. Helps debug configuration issues.',
+      inputSchema: {},
+      outputSchema: {
+        configPath: z.string(),
+        usingExampleConfig: z.boolean(),
+        reposDir: z.string().optional(),
+        repoCount: z.number(),
+        repos: z.array(z.object({
+          name: z.string(),
+          path: z.string(),
+          allowedReadPaths: z.array(z.string()),
+          allowedWritePaths: z.array(z.string()),
+          deniedPaths: z.array(z.string()),
+          tasks: z.array(z.string()),
+        })),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const configPath = process.env.CONFIG_PATH || 'config.yaml';
+      const usingExampleConfig = configPath.includes('config.example.yaml');
+      return result({
+        configPath,
+        usingExampleConfig,
+        reposDir: config.reposDir,
+        repoCount: repos.length,
+        repos: repos.map((repo) => ({
+          name: repo.name,
+          path: repo.absPath,
+          allowedReadPaths: repo.allowedReadPaths,
+          allowedWritePaths: repo.allowedWritePaths,
+          deniedPaths: repo.deniedPaths,
+          tasks: Object.keys(repo.allowedTasks ?? {}),
+        })),
+      });
+    },
+  );
+
+  server.registerTool(
+    'list_branches',
+    {
+      title: 'List local branches in a repo',
+      description: 'Use this to see all local branches in a repository, including the current branch and protected branches.',
+      inputSchema: {
+        repo: z.string(),
+      },
+      outputSchema: {
+        repo: z.string(),
+        current: z.string(),
+        local: z.array(z.string()),
+        protected: z.array(z.string()),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName }) => {
+      const repo = getRepo(config, repos, repoName);
+      const current = await currentBranch(repo);
+      const branches = await listBranches(repo);
+      const protectedBranches = config.security.protectedBranches.filter((b) => branches.includes(b));
+      return result({
+        repo: repo.name,
+        current,
+        local: branches,
+        protected: protectedBranches,
+      });
+    },
+  );
+
+  server.registerTool(
+    'ensure_branch',
+    {
+      title: 'Ensure a branch exists and switch to it',
+      description: 'Use this to create a branch if it does not exist, or switch to it if it already does. This replaces the create_branch + git_switch combination.',
+      inputSchema: {
+        repo: z.string(),
+        branch: z.string().describe('Branch name to create or switch to.'),
+        baseRef: z.string().optional().describe('Optional base ref for new branch creation. Defaults to current HEAD.'),
+      },
+      outputSchema: {
+        repo: z.string(),
+        branch: z.string(),
+        previousBranch: z.string(),
+        head: z.string(),
+        created: z.boolean(),
+        switched: z.boolean(),
+        alreadyOnBranch: z.boolean(),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+    async ({ repo: repoName, branch, baseRef }) => {
+      const repo = getRepo(config, repos, repoName);
+      validateBranchName(branch);
+      if (baseRef && !/^[A-Za-z0-9._/@-]+$/.test(baseRef)) {
+        throw new UserFacingError('baseRef contains unsupported characters.');
+      }
+
+      const previousBranch = await currentBranch(repo);
+      const exists = await branchExists(repo, branch);
+
+      if (previousBranch === branch) {
+        return result({
+          repo: repo.name,
+          branch,
+          previousBranch,
+          head: await currentHead(repo),
+          created: false,
+          switched: false,
+          alreadyOnBranch: true,
+        });
+      }
+
+      if (exists) {
+        const switched = await git(repo, ['switch', branch]);
+        assertSuccess(switched, 'Switch to existing branch');
+        return result({
+          repo: repo.name,
+          branch: await currentBranch(repo),
+          previousBranch,
+          head: await currentHead(repo),
+          created: false,
+          switched: true,
+          alreadyOnBranch: false,
+        });
+      }
+
+      const args = baseRef ? ['switch', '-c', branch, baseRef] : ['switch', '-c', branch];
+      const created = await git(repo, args);
+      assertSuccess(created, 'Create and switch to new branch');
+      return result({
+        repo: repo.name,
+        branch: await currentBranch(repo),
+        previousBranch,
+        head: await currentHead(repo),
+        created: true,
+        switched: true,
+        alreadyOnBranch: false,
+      });
+    },
+  );
+
+  server.registerTool(
+    'reload_config',
+    {
+      title: 'Reload configuration from disk',
+      description: 'Use this to reload the configuration file without restarting the server. Changes to repos, tasks, and security settings will take effect immediately.',
+      inputSchema: {
+        dryRun: z.boolean().default(false).describe('If true, only validate the config without applying changes.'),
+      },
+      outputSchema: {
+        ok: z.boolean(),
+        configPath: z.string(),
+        repoCountBefore: z.number(),
+        repoCountAfter: z.number(),
+        repos: z.array(z.object({
+          name: z.string(),
+          tasks: z.array(z.string()),
+        })),
+        error: z.string().optional(),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+    async ({ dryRun = false }) => {
+      const configPath = process.env.CONFIG_PATH || 'config.yaml';
+      const repoCountBefore = repos.length;
+
+      try {
+        const newConfig = reloadConfigFn();
+        const newRepos = getRepos(newConfig);
+
+        if (dryRun) {
+          return result({
+            ok: true,
+            configPath,
+            repoCountBefore,
+            repoCountAfter: newRepos.length,
+            repos: newRepos.map((repo) => ({
+              name: repo.name,
+              tasks: Object.keys(repo.allowedTasks ?? {}),
+            })),
+          });
+        }
+
+        config.repos = newConfig.repos;
+        config.reposDir = newConfig.reposDir;
+        config.security = newConfig.security;
+        config.server = newConfig.server;
+        config.auth = newConfig.auth;
+
+        repos.length = 0;
+        repos.push(...newRepos);
+
+        return result({
+          ok: true,
+          configPath,
+          repoCountBefore,
+          repoCountAfter: repos.length,
+          repos: repos.map((repo) => ({
+            name: repo.name,
+            tasks: Object.keys(repo.allowedTasks ?? {}),
+          })),
+        });
+      } catch (err) {
+        return result({
+          ok: false,
+          configPath,
+          repoCountBefore,
+          repoCountAfter: repoCountBefore,
+          repos: [],
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+  );
+
+  server.registerTool(
     'list_repos',
     {
       title: 'List configured local Git repos',
@@ -284,6 +531,7 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
           name: z.string(),
           description: z.string().optional(),
           command: z.array(z.string()),
+          source: z.enum(['explicit', 'auto-detected']),
           timeoutMs: z.number().optional(),
         })),
       },
@@ -291,7 +539,11 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
     },
     async ({ repo: repoName }) => {
       const repo = getRepo(config, repos, repoName);
-      const tasks = Object.entries(repo.allowedTasks ?? {}).map(([name, task]) => ({ name, ...task }));
+      const tasks = Object.entries(repo.allowedTasks ?? {}).map(([name, task]) => ({
+        name,
+        ...task,
+        source: task.description?.startsWith('Auto-detected') ? 'auto-detected' as const : 'explicit' as const,
+      }));
       return result({ repo: repo.name, tasks });
     },
   );
@@ -800,7 +1052,11 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
         unstagedFiles: z.array(z.string()),
         untrackedFiles: z.array(z.string()),
         canMerge: z.boolean(),
+        fastForward: z.boolean(),
+        wouldCreateMergeCommit: z.boolean(),
         mergeBase: z.string(),
+        targetHead: z.string(),
+        sourceHead: z.string(),
         ahead: z.number(),
         behind: z.number(),
         diffSummary: z.array(z.object({ path: z.string(), added: z.number(), deleted: z.number() })),
@@ -811,19 +1067,28 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
     },
     async ({ repo: repoName, targetBranch, sourceBranch }) => {
       const repo = getRepo(config, repos, repoName);
-      const [current, status, analysis] = await Promise.all([
+      const [current, status, analysis, targetHead, sourceHead] = await Promise.all([
         currentBranch(repo),
         gitOutput(repo, ['status', '--porcelain'], 'Get status').then(parseStatusOutput),
         analyzeMerge(repo, targetBranch, sourceBranch),
+        gitOutput(repo, ['rev-parse', targetBranch], 'Get target HEAD'),
+        gitOutput(repo, ['rev-parse', sourceBranch], 'Get source HEAD'),
       ]);
 
       const targetIsProtected = isProtectedBranch(targetBranch, config.security.protectedBranches);
       const workingTreeClean = isCleanWorkingTree(status);
+      const fastForward = analysis.behind === 0;
+      const wouldCreateMergeCommit = !fastForward && analysis.ahead > 0;
       const suggestions: string[] = [];
 
       if (!workingTreeClean) suggestions.push('Working tree is not clean. Commit or stash changes before merging.');
       if (targetIsProtected) suggestions.push('Target branch is protected. git_merge_to_target requires allowProtectedTarget=true.');
       if (!analysis.canMerge) suggestions.push('Merge conflicts detected. Resolve conflicts before running git_merge_to_target.');
+      if (fastForward && analysis.canMerge && workingTreeClean) {
+        suggestions.push('Fast-forward merge is possible. No merge commit will be created.');
+      } else if (wouldCreateMergeCommit && analysis.canMerge && workingTreeClean) {
+        suggestions.push('Merge commit will be created. Review the diff before proceeding.');
+      }
       if (analysis.canMerge && workingTreeClean) suggestions.push('Merge preflight passed. Review diffSummary, then run git_merge_to_target if appropriate.');
 
       return result({
@@ -837,7 +1102,11 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
         unstagedFiles: status.unstagedFiles,
         untrackedFiles: status.untrackedFiles,
         canMerge: analysis.canMerge,
+        fastForward,
+        wouldCreateMergeCommit,
         mergeBase: analysis.mergeBase,
+        targetHead: targetHead.trim(),
+        sourceHead: sourceHead.trim(),
         ahead: analysis.ahead,
         behind: analysis.behind,
         diffSummary: analysis.diffSummary,
@@ -860,6 +1129,8 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
         allowProtectedTarget: z.boolean().default(false).describe('Required when targetBranch is protected, such as main or master.'),
         remote: z.string().default('origin').describe('Remote name used only to prepare a manual push command.'),
         setUpstream: z.boolean().default(true).describe('Whether the prepared push command should include -u.'),
+        noFastForward: z.boolean().default(false).describe('Force a merge commit even if fast-forward is possible.'),
+        restorePreviousBranch: z.boolean().default(true).describe('Switch back to the previous branch after merging.'),
       },
       outputSchema: {
         repo: z.string(),
@@ -868,14 +1139,14 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
         targetBranch: z.string(),
         sourceBranch: z.string(),
         commit: z.string().nullable(),
-        status: z.string(),
+        status: z.enum(['merged', 'already_up_to_date', 'failed']),
         conflicts: z.array(z.string()),
         pushCommand: z.string(),
         warning: z.string(),
       },
       annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
     },
-    async ({ repo: repoName, targetBranch, sourceBranch, message, allowProtectedTarget = false, remote = 'origin', setUpstream = true }) => {
+    async ({ repo: repoName, targetBranch, sourceBranch, message, allowProtectedTarget = false, remote = 'origin', setUpstream = true, noFastForward = false, restorePreviousBranch = true }) => {
       const repo = getRepo(config, repos, repoName);
       validateBranchName(targetBranch);
       validateBranchName(sourceBranch);
@@ -902,8 +1173,10 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
         assertSuccess(switched, 'Switch to target branch');
       }
 
-      const args = ['merge', sourceBranch];
+      const args = ['merge'];
+      if (noFastForward) args.push('--no-ff');
       if (message) args.push('-m', validateCommitMessage(message));
+      args.push(sourceBranch);
       const mergeResult = await git(repo, args, config.security.commandTimeoutMs);
 
       if (mergeResult.code !== 0) {
@@ -911,6 +1184,11 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
           .split(/\r?\n/)
           .filter((line) => line.includes('CONFLICT'))
           .slice(0, 20);
+        
+        if (previousBranch !== targetBranch && restorePreviousBranch) {
+          await git(repo, ['switch', previousBranch]).catch(() => {});
+        }
+        
         audit(repo, 'git_merge_to_target', false, undefined, mergeResult.stderr, targetBranch);
         return result({
           repo: repo.name,
@@ -919,7 +1197,7 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
           targetBranch,
           sourceBranch,
           commit: null,
-          status: `merge failed: ${mergeResult.stderr}`,
+          status: 'failed',
           conflicts,
           pushCommand: '',
           warning: 'Merge failed locally. Resolve conflicts manually before pushing.',
@@ -932,16 +1210,21 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       const pushCommand = ['git', ...pushArgs.map(shellQuote)].join(' ');
       const commit = await currentHead(repo);
       const current = await currentBranch(repo);
+      
+      if (previousBranch !== targetBranch && restorePreviousBranch) {
+        await git(repo, ['switch', previousBranch]).catch(() => {});
+      }
+      
       audit(repo, 'git_merge_to_target', true, undefined, undefined, current);
 
       return result({
         repo: repo.name,
         previousBranch,
-        currentBranch: current,
+        currentBranch: await currentBranch(repo),
         targetBranch,
         sourceBranch,
         commit,
-        status: 'merged',
+        status: mergeResult.stdout.includes('Already up to date') ? 'already_up_to_date' : 'merged',
         conflicts: [],
         pushCommand,
         warning: 'Local merge completed. No remote push was performed. Review status and run pushCommand manually if appropriate.',
@@ -1014,6 +1297,95 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       const branch = await currentBranch(repo);
       audit(repo, 'apply_patch', true, touchedPaths, undefined, branch);
       return result({ repo: repo.name, touchedPaths, backupPath, status: 'applied' });
+    },
+  );
+
+  server.registerTool(
+    'edit_file_sections',
+    {
+      title: 'Edit file sections using markers',
+      description: 'Use this to make targeted edits to files by specifying markers and replacement content. More reliable than apply_patch for complex edits.',
+      inputSchema: {
+        repo: z.string(),
+        path: z.string().describe('Repo-relative file path.'),
+        expected_sha256: z.string().describe('sha256 returned by read_file to ensure file has not changed.'),
+        edits: z.array(z.object({
+          mode: z.enum(['insert_before', 'insert_after', 'replace_block']),
+          marker: z.string().describe('Unique text marker to locate the edit target.'),
+          content: z.string().describe('Content to insert or replace with.'),
+        })).min(1).max(10),
+      },
+      outputSchema: {
+        repo: z.string(),
+        path: z.string(),
+        sha256: z.string(),
+        bytes: z.number(),
+        backupPath: z.string().nullable(),
+        replacements: z.number(),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+    async ({ repo: repoName, path: relInput, expected_sha256, edits }) => {
+      const repo = getRepo(config, repos, repoName);
+      await ensureWritableBranch(config, repo, 'edit_file_sections');
+      const rel = ensurePathAllowed(config, repo, relInput, 'write');
+      const abs = path.join(repo.absPath, rel);
+
+      if (!fs.existsSync(abs)) {
+        throw new UserFacingError(`File '${rel}' does not exist. Use write_file to create it.`);
+      }
+
+      const buffer = ensureTextFileReadable(abs, config.security.maxReadBytes);
+      const currentSha = sha256Buffer(buffer);
+
+      if (expected_sha256 !== currentSha) {
+        throw new UserFacingError(`sha256 mismatch for '${rel}'. Current=${currentSha}, expected=${expected_sha256}. Re-read the file before editing.`);
+      }
+
+      let content = buffer.toString('utf8');
+      let totalReplacements = 0;
+
+      for (const edit of edits) {
+        const markerCount = content.split(edit.marker).length - 1;
+        if (markerCount === 0) {
+          throw new UserFacingError(`Marker '${edit.marker.slice(0, 50)}...' not found in '${rel}'.`);
+        }
+        if (markerCount > 1) {
+          throw new UserFacingError(`Marker '${edit.marker.slice(0, 50)}...' appears ${markerCount} times in '${rel}'. Markers must be unique.`);
+        }
+
+        switch (edit.mode) {
+          case 'insert_before': {
+            content = content.replace(edit.marker, `${edit.content}${edit.marker}`);
+            totalReplacements++;
+            break;
+          }
+          case 'insert_after': {
+            content = content.replace(edit.marker, `${edit.marker}${edit.content}`);
+            totalReplacements++;
+            break;
+          }
+          case 'replace_block': {
+            content = content.replace(edit.marker, edit.content);
+            totalReplacements++;
+            break;
+          }
+        }
+      }
+
+      const backupPath = makeBackup(repo, [rel]);
+      fs.writeFileSync(abs, content, 'utf8');
+      const branch = await currentBranch(repo);
+      audit(repo, 'edit_file_sections', true, [rel], undefined, branch);
+
+      return result({
+        repo: repo.name,
+        path: rel,
+        sha256: sha256Text(content),
+        bytes: Buffer.byteLength(content, 'utf8'),
+        backupPath,
+        replacements: totalReplacements,
+      });
     },
   );
 

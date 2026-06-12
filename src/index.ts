@@ -46,11 +46,15 @@ app.get('/healthz', (_req, res) => {
     name: 'chatgpt-local-git-mcp',
     version: '0.1.0',
     mcpPath: config.server.mcpPath,
+    configPath: process.env.CONFIG_PATH || 'config.yaml',
     authRequired: Boolean(getBearerToken()),
     repoCount: repos.length,
-    repos: repos.map((repo) => repo.name),
     toolCount: REGISTERED_TOOL_NAMES.length,
-    tools: REGISTERED_TOOL_NAMES,
+    tools: [...REGISTERED_TOOL_NAMES],
+    repos: repos.map((repo) => ({
+      name: repo.name,
+      tasks: Object.keys(repo.allowedTasks ?? {}),
+    })),
   });
 });
 
