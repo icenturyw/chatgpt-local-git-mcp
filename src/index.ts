@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { loadConfig, getRepos } from './config.js';
-import { createMcpServer } from './tools.js';
+import { createMcpServer, REGISTERED_TOOL_NAMES } from './tools.js';
 import { UserFacingError } from './security.js';
 import { watchReposDir } from './watcher.js';
 
@@ -41,13 +41,23 @@ app.use(express.json({ limit: config.server.maxRequestBodyBytes }));
 app.use(authMiddleware);
 
 app.get('/healthz', (_req, res) => {
-  res.json({ ok: true, name: 'chatgpt-local-git-mcp', repos: repos.map((repo) => repo.name) });
+  res.json({
+    ok: true,
+    name: 'chatgpt-local-git-mcp',
+    version: '0.1.0',
+    mcpPath: config.server.mcpPath,
+    authRequired: Boolean(getBearerToken()),
+    repoCount: repos.length,
+    repos: repos.map((repo) => repo.name),
+    toolCount: REGISTERED_TOOL_NAMES.length,
+    tools: REGISTERED_TOOL_NAMES,
+  });
 });
 
 // RFC 9728 OAuth Protected Resource Metadata
 app.get('/.well-known/oauth-protected-resource/mcp', (_req, res) => {
   res.json({
-    resource: `${_req.protocol}://${_req.get('host')}/mcp`,
+    resource: `${_req.protocol}://${_req.get('host')}${config.server.mcpPath}`,
     bearer_methods_supported: ['header'],
   });
 });

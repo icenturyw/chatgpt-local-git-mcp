@@ -32,6 +32,35 @@ import {
 } from './git.js';
 import { writeAuditLog, type AuditEvent } from './audit.js';
 
+export const REGISTERED_TOOL_NAMES = [
+  'list_repos',
+  'list_tasks',
+  'repo_tree',
+  'read_file',
+  'search_code',
+  'read_file_around_match',
+  'git_status',
+  'git_diff',
+  'create_branch',
+  'git_switch',
+  'prepare_merge',
+  'git_merge',
+  'write_file',
+  'apply_patch',
+  'run_task',
+  'git_add',
+  'git_commit',
+  'prepare_push',
+  'replace_text',
+  'replace_in_file',
+  'validate_patch',
+  'prepare_pr_text',
+  'git_workflow_status',
+  'git_diff_summary',
+  'list_backups',
+  'restore_backup',
+] as const;
+
 function result<T extends Record<string, unknown>>(structuredContent: T): ToolTextResult<T> {
   return {
     structuredContent,
@@ -438,11 +467,12 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
         repo: z.string(),
         branch: z.string().describe('New local branch name, for example feat/chatgpt-admin-fix.'),
         baseRef: z.string().optional().describe('Optional base ref. Defaults to current HEAD.'),
+        switchIfExists: z.boolean().default(false).describe('Switch to the branch when it already exists instead of failing.'),
       },
-      outputSchema: { repo: z.string(), branch: z.string(), previousBranch: z.string(), head: z.string() },
+      outputSchema: { repo: z.string(), branch: z.string(), previousBranch: z.string(), head: z.string(), created: z.boolean() },
       annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
     },
-    async ({ repo: repoName, branch, baseRef }) => {
+    async ({ repo: repoName, branch, baseRef, switchIfExists = false }) => {
       const repo = getRepo(config, repos, repoName);
       validateBranchName(branch);
       if (baseRef && !/^[A-Za-z0-9._/@-]+$/.test(baseRef)) throw new UserFacingError('baseRef contains unsupported characters.');
@@ -450,9 +480,22 @@ export function createMcpServer(config: AppConfig, repos: RepoRuntime[]): McpSer
       const check = await git(repo, ['check-ref-format', '--branch', branch]);
       assertSuccess(check, 'Validate branch name');
       const args = baseRef ? ['switch', '-c', branch, baseRef] : ['switch', '-c', branch];
+      const exists = await branchExists(repo, branch);
+
+      if (exists) {
+        if (!switchIfExists) {
+          throw new UserFacingError(`Branch '${branch}' already exists. Call create_branch with switchIfExists enabled or use git_switch.`);
+        }
+        if (previousBranch !== branch) {
+          const switchedExisting = await git(repo, ['switch', branch]);
+          assertSuccess(switchedExisting, 'Switch to existing branch');
+        }
+        return result({ repo: repo.name, branch: await currentBranch(repo), previousBranch, head: await currentHead(repo), created: false });
+      }
+
       const switched = await git(repo, args);
       assertSuccess(switched, 'Create local branch');
-      return result({ repo: repo.name, branch: await currentBranch(repo), previousBranch, head: await currentHead(repo) });
+      return result({ repo: repo.name, branch: await currentBranch(repo), previousBranch, head: await currentHead(repo), created: true });
     },
   );
 

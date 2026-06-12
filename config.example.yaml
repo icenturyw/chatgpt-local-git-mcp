@@ -16,13 +16,33 @@ security:
     - .git
     - .env
     - .env.*
+    - '**/.env'
+    - '**/.env.*'
     - id_rsa
     - id_ed25519
+    - '**/id_rsa'
+    - '**/id_ed25519'
     - '*.pem'
     - '*.key'
+    - '*.crt'
+    - '*.cer'
+    - '*.p12'
+    - '*.pfx'
+    - '**/*.pem'
+    - '**/*.key'
+    - '**/*.crt'
+    - '**/*.cer'
+    - '**/*.p12'
+    - '**/*.pfx'
     - secrets
+    - secrets/**
+    - '**/secrets/**'
     - node_modules
+    - node_modules/**
+    - '**/node_modules/**'
     - __pycache__
+    - __pycache__/**
+    - '**/__pycache__/**'
   # Branches where write operations are blocked. Create a feature branch first.
   protectedBranches:
     - main
